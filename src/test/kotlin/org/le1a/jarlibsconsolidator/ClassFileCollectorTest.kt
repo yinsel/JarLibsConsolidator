@@ -49,6 +49,7 @@ class ClassFileCollectorTest {
         assertTrue(scan.skipped.isEmpty())
         val roots = ClassFileCollector.copy(scan.classes, project.resolve("all-in-one/classes"))
         assertEquals(1, roots.size)
+        assertEquals(project.resolve("all-in-one/classes"), roots.single())
         URLClassLoader(roots.map { it.toUri().toURL() }.toTypedArray(), null).use { loader ->
             for (name in listOf("demo.Example", "demo.Example\$Inner", "DefaultClass")) {
                 assertEquals(name, loader.loadClass(name).name)
@@ -76,6 +77,12 @@ class ClassFileCollectorTest {
         }
         val roots = ClassFileCollector.copy(ClassFileCollector.scan(project).classes, project.resolve("all-in-one/classes"))
         assertEquals(2, roots.size)
+        assertEquals(setOf("a__target__classes", "b__build__classes__java__main"), roots.map { it.fileName.toString() }.toSet())
+        roots.forEach { assertEquals(project.resolve("all-in-one/classes-conflicts"), it.parent) }
+        assertFalse(Files.exists(project.resolve("all-in-one/classes/demo/Same.class")))
+        val sourceIndex = Files.readString(project.resolve("all-in-one/classes-conflicts/sources.tsv"))
+        assertTrue(sourceIndex.contains("a/target/classes/demo/Same.class"))
+        assertTrue(sourceIndex.contains("b/build/classes/java/main/demo/Same.class"))
         val values = roots.map { root ->
             URLClassLoader(arrayOf(root.toUri().toURL()), null).use {
                 it.loadClass("demo.Same").getMethod("value").invoke(null)
@@ -84,12 +91,86 @@ class ClassFileCollectorTest {
         assertEquals(setOf(1, 2), values.toSet())
     }
 
-    @Test fun `duplicate bytecode in one folder is not overwritten or renamed`() {
+    @Test fun `identical bytecode with different filenames is deduplicated`() {
         val project = temporary.newFolder().toPath()
         val output = compile(project, "flat", "Same", "public class Same {}")
         Files.copy(output.resolve("Same.class"), output.resolve("copy.class"))
         val roots = ClassFileCollector.copy(ClassFileCollector.scan(project).classes, project.resolve("all-in-one/classes"))
-        assertEquals(2, roots.size)
+        assertEquals(listOf(project.resolve("all-in-one/classes")), roots)
+        assertTrue(Files.exists(roots.single().resolve("Same.class")))
+        assertFalse(Files.exists(project.resolve("all-in-one/classes-conflicts")))
+    }
+
+    @Test fun `nonconflicting classes from multiple modules share one classes root`() {
+        val project = temporary.newFolder().toPath()
+        compile(project, "a/target/classes", "First", "package demo; public class First {}")
+        compile(project, "b/build/classes", "Second", "package other; public class Second {}")
+        val output = project.resolve("all-in-one/classes")
+        val roots = ClassFileCollector.copy(ClassFileCollector.scan(project).classes, output)
+        assertEquals(listOf(output), roots)
+        URLClassLoader(arrayOf(output.toUri().toURL()), null).use {
+            assertEquals("demo.First", it.loadClass("demo.First").name)
+            assertEquals("other.Second", it.loadClass("other.Second").name)
+        }
+    }
+
+    @Test fun `identical bytecode from different folders only produces one copy`() {
+        val project = temporary.newFolder().toPath()
+        val original = compile(project, "a/classes", "Same", "package demo; public class Same {}")
+        val duplicate = project.resolve("b/classes/demo/Same.class")
+        Files.createDirectories(duplicate.parent)
+        Files.copy(original.resolve("demo/Same.class"), duplicate)
+        val output = project.resolve("all-in-one/classes")
+        assertEquals(listOf(output), ClassFileCollector.copy(ClassFileCollector.scan(project).classes, output))
+        assertEquals(-1L, Files.mismatch(original.resolve("demo/Same.class"), output.resolve("demo/Same.class")))
+    }
+
+    @Test fun `mixed collection deduplicates versions and isolates only conflicting names`() {
+        val project = temporary.newFolder().toPath()
+        val first = compile(project, "a/classes", "Same", "package demo; public class Same { public static int value() { return 1; } }")
+        compile(project, "b/classes", "Same", "package demo; public class Same { public static int value() { return 2; } }")
+        compile(project, "b/classes", "Unique", "package demo; public class Unique {}")
+        val duplicate = project.resolve("c/classes/demo/Same.class")
+        Files.createDirectories(duplicate.parent)
+        Files.copy(first.resolve("demo/Same.class"), duplicate)
+        val output = project.resolve("all-in-one/classes")
+        val scan = ClassFileCollector.scan(project)
+        // Reverse the input to prove representative selection is independent of caller ordering.
+        val roots = ClassFileCollector.copy(scan.classes.reversed(), output)
+        assertEquals(3, roots.size)
+        assertEquals(output, roots.first())
+        assertTrue(Files.exists(output.resolve("demo/Unique.class")))
+        assertFalse(Files.exists(output.resolve("demo/Same.class")))
+        assertEquals(listOf("a__classes", "b__classes"), roots.drop(1).map { it.fileName.toString() })
+        assertFalse(Files.exists(project.resolve("all-in-one/classes-conflicts/c__classes")))
+        roots.drop(1).forEach { assertFalse(Files.exists(it.resolve("demo/Unique.class"))) }
+    }
+
+    @Test fun `different versions in the same flat folder retain source filenames in root names`() {
+        val project = temporary.newFolder().toPath()
+        val first = compile(project, "first", "Same", "public class Same { public static int value() { return 1; } }")
+        val second = compile(project, "second", "Same", "public class Same { public static int value() { return 2; } }")
+        val flat = Files.createDirectories(project.resolve("flat"))
+        Files.move(first.resolve("Same.class"), flat.resolve("original.class"))
+        Files.move(second.resolve("Same.class"), flat.resolve("renamed.class"))
+        val roots = ClassFileCollector.copy(ClassFileCollector.scan(project).classes, project.resolve("all-in-one/classes"))
+        assertEquals(listOf("flat", "flat__from-renamed.class"), roots.map { it.fileName.toString() })
+        val values = roots.map { root ->
+            URLClassLoader(arrayOf(root.toUri().toURL()), null).use {
+                it.loadClass("Same").getMethod("value").invoke(null)
+            }
+        }
+        assertEquals(listOf(1, 2), values)
+    }
+
+    @Test fun `ambiguous flattened folder names are disambiguated without losing either version`() {
+        val project = temporary.newFolder().toPath()
+        compile(project, "a/b", "Same", "public class Same { public static int value() { return 1; } }")
+        compile(project, "a__b", "Same", "public class Same { public static int value() { return 2; } }")
+        val roots = ClassFileCollector.copy(ClassFileCollector.scan(project).classes, project.resolve("all-in-one/classes"))
+        assertEquals(2, roots.distinct().size)
+        assertEquals("a__b", roots[0].fileName.toString())
+        assertTrue(roots[1].fileName.toString().startsWith("a__b--"))
         roots.forEach { assertTrue(Files.exists(it.resolve("Same.class"))) }
     }
 

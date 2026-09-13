@@ -30,9 +30,9 @@ cp `find ./ -name "*.jar"` ./all-in-one
 - **一键操作**：右键项目 → 选择"**一键添加依赖**"。
 - **智能扫描**：递归扫描 `.jar`，跳过常见目录（如 `node_modules`、`target`、`build`、`.gradle`、`.mvn` 等）。
 - **class 文件支持**：递归收集项目中的 `.class`，包含 `target/classes`、`build/classes`、`out/production`、多模块和隐藏目录中的编译产物；只有 class、没有 JAR 的项目也可使用。
-- **恢复包目录**：读取字节码中的类名，按真实包路径复制到 `all-in-one/classes/root-N/`，支持内部类、默认包，以及目录被打平或文件被重命名的 class 文件。
+- **恢复包目录**：读取字节码中的类名，将不冲突的类统一复制到 `all-in-one/classes/`，支持内部类、默认包，以及目录被打平或文件被重命名的 class 文件。
 - **重名处理**：自动对同名 jar 加后缀去重（如 `x.jar` → `x_2.jar`）。
-- **同名 class**：不同编译输出中的同名类放在独立库根目录，保持类名和字节码不变，避免覆盖。
+- **同名 class**：完整类名相同且字节内容相同的文件只保留一份；只有内容不同的同名类才放进 `all-in-one/classes-conflicts/`，按来源目录命名并注册为独立库根。
 - **统一管理**：复制到 `all-in-one/`，创建项目级库 `all-in-one` 并添加至所有模块依赖。
 - **版本范围**：插件声明支持 build `223`–`262.*`，包含 `IU-262.10315.125`。
 
@@ -84,13 +84,17 @@ cp `find ./ -name "*.jar"` ./all-in-one
 - 完成后可在项目结构的 `Libraries` 看到 `all-in-one`，并已挂载至所有模块。
 - 等待 IDEA 索引完成后，即可识别这些类并查看反编译结果。class 文件更新后，需重新运行一次以刷新副本。
 
-例如 `target/classes/com/example/App.class` 会按字节码中的名称复制为 `all-in-one/classes/root-1/com/example/App.class`，库的 Classes 根目录指向 `root-1`，使 IDEA 能识别 `com.example.App`。
+例如 `target/classes/com/example/App.class` 会按字节码中的名称复制为 `all-in-one/classes/com/example/App.class`，库的 Classes 根目录指向 `classes`，使 IDEA 能识别 `com.example.App`。不同文件夹中的其他不冲突类也合并到这个目录。
+
+如果 `module-a/target/classes` 和 `module-b/target/classes` 都有 `com.example.App`，但字节内容不同，两个版本分别放在 `classes-conflicts/module-a__target__classes/com/example/App.class` 和 `classes-conflicts/module-b__target__classes/com/example/App.class`，不在公共 `classes/` 中任意保留一个版本。相同内容的副本不会增加额外库根。
+
+冲突根目录用项目内相对来源路径命名，路径分隔符替换为 `__`；同一文件夹内的不同版本会附加原始文件名。目录名重名或过长时附加来源路径摘要，`classes-conflicts/sources.tsv` 记录所保留版本的完整原始相对路径。冲突根放在公共 `classes/` 之外，避免来源目录被误识别为包名。
 
 class 扫描跳过版本控制目录（`.git`、`.hg`、`.svn`）和已有 `all-in-one` 输出，不跟随符号链接。无法读取或头部无效的 class 文件会被跳过，完成提示中会显示跳过数量。
 
 ### 工作原理（简述）
 1. 遍历工程目录收集 JAR 和独立 class 文件。
-2. JAR 复制到 `all-in-one/`；class 根据字节码包名整理到 `all-in-one/classes/root-N/`，不同来源的同名类使用独立根目录。
+2. JAR 复制到 `all-in-one/`；class 按完整类名分组并比较字节内容，不冲突或内容相同的类统一整理到 `all-in-one/classes/`，内容不同的同名类放入按来源命名的冲突根目录。
 3. 创建/刷新项目库 `all-in-one`，将 JAR 根和 class 包目录的根分别注册为 `CLASSES`，并添加到所有模块依赖。
 
 ### 兼容性与要求
@@ -102,7 +106,7 @@ class 扫描跳过版本控制目录（`.git`、`.hg`、`.svn`）和已有 `all-
 ### 常见问答
 - **会修改源码吗？** 不会，仅复制 JAR/class 文件并写入项目库配置。
 - **扫描很慢怎么办？** class 扫描会覆盖整个项目，包括编译输出；可取消任务，并整理不需要的旧编译产物后重试。
-- **同一个类有多个版本怎么办？** 插件保留各版本，但 IDEA 仍按模块依赖/库根顺序解析同名类。请移除不需要的旧版本以避免歧义。
+- **同一个类有多个版本怎么办？** 相同字节内容去重，内容不同则保留各版本并标明来源，但 IDEA 仍按模块依赖/库根顺序解析同名类。请移除不需要的旧版本以避免歧义。
 - **class 缺少依赖怎么办？** 独立 class 文件本身不包含所有外部依赖；请把相应依赖 JAR 一并放入项目后再次收集。
 
 ### 开发
