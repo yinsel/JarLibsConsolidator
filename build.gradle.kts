@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "org.le1a"
-version = providers.gradleProperty("pluginVersion").orElse("1.2").get()
+version = providers.gradleProperty("pluginVersion").orElse("1.3").get()
 
 repositories {
     mavenCentral()
@@ -19,6 +19,8 @@ repositories {
 }
 
 dependencies {
+    testImplementation("junit:junit:4.13.2")
+    testImplementation(kotlin("stdlib"))
     intellijPlatform {
         intellijIdeaUltimate("2024.1.6")
         bundledPlugins("com.intellij.java")

@@ -1,6 +1,6 @@
 ## JarLibsConsolidator
 
-一键收集并合并项目中的 JAR 依赖，统一输出到 `all-in-one` 目录，并自动添加为项目库，挂载到所有模块。
+一键收集项目中的 JAR 和独立 `.class` 文件，统一输出到 `all-in-one` 目录，并自动添加为项目库，挂载到所有模块，让 IDEA 能索引和反编译这些类。
 
 ![Kotlin](https://img.shields.io/badge/Kotlin-1.9.25-7F52FF?logo=kotlin) ![Gradle](https://img.shields.io/badge/Gradle-8.x-02303A?logo=gradle) ![IntelliJ%20Platform](https://img.shields.io/badge/IntelliJ%20Platform-223--262.*-000?logo=intellijidea) ![JDK](https://img.shields.io/badge/JDK-17-5382A1)
 
@@ -29,7 +29,10 @@ cp `find ./ -name "*.jar"` ./all-in-one
 ### 特性
 - **一键操作**：右键项目 → 选择"**一键添加依赖**"。
 - **智能扫描**：递归扫描 `.jar`，跳过常见目录（如 `node_modules`、`target`、`build`、`.gradle`、`.mvn` 等）。
+- **class 文件支持**：递归收集项目中的 `.class`，包含 `target/classes`、`build/classes`、`out/production`、多模块和隐藏目录中的编译产物；只有 class、没有 JAR 的项目也可使用。
+- **恢复包目录**：读取字节码中的类名，按真实包路径复制到 `all-in-one/classes/root-N/`，支持内部类、默认包，以及目录被打平或文件被重命名的 class 文件。
 - **重名处理**：自动对同名 jar 加后缀去重（如 `x.jar` → `x_2.jar`）。
+- **同名 class**：不同编译输出中的同名类放在独立库根目录，保持类名和字节码不变，避免覆盖。
 - **统一管理**：复制到 `all-in-one/`，创建项目级库 `all-in-one` 并添加至所有模块依赖。
 - **版本范围**：插件声明支持 build `223`–`262.*`，包含 `IU-262.10315.125`。
 
@@ -76,13 +79,19 @@ cp `find ./ -name "*.jar"` ./all-in-one
 
 ### 使用
 - 在 Project 视图中右键项目根目录或任意目录 → 选择“**一键添加依赖**”。
+- 扫描范围为整个项目根目录，JAR 和独立 class 文件会一起加入库。
 - 若 `all-in-one/` 已存在，会提示是否删除并重建。
 - 完成后可在项目结构的 `Libraries` 看到 `all-in-one`，并已挂载至所有模块。
+- 等待 IDEA 索引完成后，即可识别这些类并查看反编译结果。class 文件更新后，需重新运行一次以刷新副本。
+
+例如 `target/classes/com/example/App.class` 会按字节码中的名称复制为 `all-in-one/classes/root-1/com/example/App.class`，库的 Classes 根目录指向 `root-1`，使 IDEA 能识别 `com.example.App`。
+
+class 扫描跳过版本控制目录（`.git`、`.hg`、`.svn`）和已有 `all-in-one` 输出，不跟随符号链接。无法读取或头部无效的 class 文件会被跳过，完成提示中会显示跳过数量。
 
 ### 工作原理（简述）
-1. 遍历工程目录收集所有 `.jar` 文件（跳过常见无关目录）。
-2. 复制到 `all-in-one/`，处理重名冲突。
-3. 创建/刷新项目库 `all-in-one`，将 jar 作为 `CLASSES` 根添加，并依附到所有模块。
+1. 遍历工程目录收集 JAR 和独立 class 文件。
+2. JAR 复制到 `all-in-one/`；class 根据字节码包名整理到 `all-in-one/classes/root-N/`，不同来源的同名类使用独立根目录。
+3. 创建/刷新项目库 `all-in-one`，将 JAR 根和 class 包目录的根分别注册为 `CLASSES`，并添加到所有模块依赖。
 
 ### 兼容性与要求
 - **IDE 声明范围**：build `223`–`262.*`（包含 `IU-262.10315.125`），保留原最低版本 `223`。
@@ -91,11 +100,16 @@ cp `find ./ -name "*.jar"` ./all-in-one
 - **运行时插件**：`com.intellij.java`（已通过平台打包）
 
 ### 常见问答
-- **会修改源码吗？** 不会，仅复制 jar 并写入项目库配置。
-- **扫描很慢怎么办？** 建议在项目根执行，插件已默认跳过体量较大的常见目录；也可在更小的子目录执行。
+- **会修改源码吗？** 不会，仅复制 JAR/class 文件并写入项目库配置。
+- **扫描很慢怎么办？** class 扫描会覆盖整个项目，包括编译输出；可取消任务，并整理不需要的旧编译产物后重试。
+- **同一个类有多个版本怎么办？** 插件保留各版本，但 IDEA 仍按模块依赖/库根顺序解析同名类。请移除不需要的旧版本以避免歧义。
+- **class 缺少依赖怎么办？** 独立 class 文件本身不包含所有外部依赖；请把相应依赖 JAR 一并放入项目后再次收集。
 
 ### 开发
 ```bash
+# 单元测试（使用 javac 生成真实字节码并验证类路径加载）
+./gradlew test
+
 # 验证插件
 ./gradlew verifyPlugin
 
