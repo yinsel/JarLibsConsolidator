@@ -118,6 +118,19 @@ class ClassExportServiceTest {
         assertTrue(Files.exists(compile("Answer", source).resolve("demo/Answer.class")))
     }
 
+    @Test fun `Java export preserves different bytecode versions with source jar names`() {
+        val project = temporary.newFolder().toPath()
+        val first = jar(project.resolve("first.jar"), compile("Same", "package demo; public class Same { public int value() { return 1; } }"))
+        jar(project.resolve("second.jar"), compile("Same", "package demo; public class Same { public int value() { return 2; } }"))
+        val target = project.resolve("sources.zip")
+        val result = ClassExportService.export(project, listOf(first), target, ExportFilter(), IdeaJavaDecompiler())
+        assertEquals(result.failures.toString(), 2, result.exported)
+        val sources = entries(target).filterKeys { it.endsWith(".java") }
+        assertEquals(2, sources.size)
+        assertTrue(sources.any { (name, bytes) -> name.startsWith("conflicts/first.jar--") && "return 1;" in bytes.toString(Charsets.UTF_8) })
+        assertTrue(sources.any { (name, bytes) -> name.startsWith("conflicts/second.jar--") && "return 2;" in bytes.toString(Charsets.UTF_8) })
+    }
+
     @Test fun `inner classes export separately and blacklisted inner content cannot leak`() {
         val project = temporary.newFolder().toPath()
         jar(project.resolve("input.jar"), compile("Outer", """
