@@ -1,5 +1,7 @@
 package org.le1a.jarlibsconsolidator
 
+// Frozen 1.5.1 baseline from ed5ae3d8c4252c8e0297ee082db54857a418ed11; benchmark-only.
+
 import java.io.IOException
 import java.io.InputStream
 import java.nio.file.AtomicMoveNotSupportedException
@@ -9,32 +11,29 @@ import java.nio.file.Path
 import java.nio.file.SimpleFileVisitor
 import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.BasicFileAttributes
+import java.security.MessageDigest
+import java.util.HexFormat
 import java.util.concurrent.CancellationException
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
 
-internal data class DecompiledClass(val source: String, val warnings: List<String> = emptyList())
-internal fun interface ClassDecompiler {
-    fun decompile(file: Path, internalName: String, checkCanceled: () -> Unit): DecompiledClass
-}
-
 /** IO-only export pipeline, separate from IntelliJ's UI and library discovery. */
-internal object ClassExportService {
+internal object PreScanOptimizationExport {
     data class Result(val discovered: Int, val filtered: Int, val duplicates: Int, val exported: Int, val failures: List<String>)
     private data class Item(val name: String, val file: Path, val origin: String, val group: String, val digest: String)
+    private const val MAX_CLASS_BYTES = 64L * 1024 * 1024
 
     fun export(
         project: Path,
         libraries: List<Path>,
         target: Path,
-        filter: ExportFilter,
+        filter: PreScanOptimizationFilter,
         decompiler: ClassDecompiler? = null,
         checkCanceled: () -> Unit = {},
         progress: (String, Double) -> Unit = { _, _ -> },
         parallelism: Int = OrderedParallelDecompiler.defaultParallelism()
     ): Result {
-        require(libraries.isNotEmpty()) { "没有已登记的依赖库，请先执行“一键添加依赖”后再导出。" }
         val base = project.toAbsolutePath().normalize()
         val destination = target.toAbsolutePath().normalize()
         val work = Files.createTempDirectory("jarlibs-export-")
@@ -48,7 +47,6 @@ internal object ClassExportService {
         val seenFiles = mutableSetOf<Path>()
         val seenDirectories = mutableSetOf<Path>()
         val versions = mutableMapOf<String, MutableList<Item>>()
-        val scanProgress = ScanProgress(progress)
 
         fun sourceLabel(path: Path): String = if (path.startsWith(base)) base.relativize(path).toString().replace('\\', '/')
             else "external/" + path.toList().takeLast(4).joinToString("/")
@@ -62,12 +60,27 @@ internal object ClassExportService {
         fun collect(origin: String, group: String, open: () -> InputStream) {
             checkCanceled()
             discovered++
-            scanProgress.update { "扫描依赖库：已扫描 $discovered 个 class，已过滤 $filtered 个；$origin" }
+            progress("扫描：$origin", 0.1)
             try {
-                val staged = work.resolve("$discovered.class")
-                val accepted = ClassSnapshot.read(open(), staged, filter, checkCanceled)
-                if (accepted == null) { filtered++; return }
-                val (name, digest) = accepted
+                val name = ClassFileCollector.readInternalName(open())
+                if (!filter.accepts(name)) { filtered++; return }
+                val staged = work.resolve("input-${discovered}").resolve("$name.class")
+                Files.createDirectories(staged.parent)
+                val hash = MessageDigest.getInstance("SHA-256")
+                open().use { input -> Files.newOutputStream(staged).use { output ->
+                    val buffer = ByteArray(8192)
+                    var total = 0L
+                    while (true) {
+                        checkCanceled()
+                        val size = input.read(buffer)
+                        if (size < 0) break
+                        total += size
+                        if (total > MAX_CLASS_BYTES) throw IOException("class 文件超过 64 MiB")
+                        hash.update(buffer, 0, size)
+                        output.write(buffer, 0, size)
+                    }
+                } }
+                val digest = HexFormat.of().formatHex(hash.digest())
                 val existing = versions.getOrPut(name) { mutableListOf() }
                 if (existing.any { it.digest == digest && Files.mismatch(it.file, staged) == -1L }) {
                     duplicates++
@@ -97,7 +110,6 @@ internal object ClassExportService {
                                     var total = 0L
                                     while (true) {
                                         checkCanceled()
-                                        scanProgress.update { "读取依赖库中的嵌套 JAR：$origin" }
                                         val size = input.read(buffer)
                                         if (size < 0) break
                                         total += size
@@ -114,16 +126,12 @@ internal object ClassExportService {
             } catch (e: Exception) { failure(label, e) }
         }
 
-        fun scanFile(path: Path, knownRegular: Boolean = false) {
+        fun scanFile(path: Path) {
             checkCanceled()
-            val filename = path.fileName.toString()
-            val isClass = filename.endsWith(".class", true)
-            val isJar = filename.endsWith(".jar", true)
-            if ((!isClass && !isJar) || !seenFiles.add(path)) return
-            if (!knownRegular && Files.isSymbolicLink(path)) return
+            if (!seenFiles.add(path) || Files.isSymbolicLink(path)) return
             when {
-                isClass -> collect(sourceLabel(path), sourceLabel(path.parent)) { Files.newInputStream(path) }
-                isJar -> scanJar(path)
+                path.fileName.toString().endsWith(".class", true) -> collect(sourceLabel(path), sourceLabel(path.parent)) { Files.newInputStream(path) }
+                path.fileName.toString().endsWith(".jar", true) -> scanJar(path)
             }
         }
 
@@ -132,12 +140,11 @@ internal object ClassExportService {
             Files.walkFileTree(root, object : SimpleFileVisitor<Path>() {
                 override fun preVisitDirectory(dir: Path, attrs: BasicFileAttributes): FileVisitResult {
                     checkCanceled()
-                    scanProgress.update { "遍历依赖库：${sourceLabel(dir)}；已扫描 $discovered 个 class，已过滤 $filtered 个" }
-                    if (dir != root && dir.fileName.toString() in setOf(".git", ".hg", ".svn")) return FileVisitResult.SKIP_SUBTREE
+                    if (dir != root && dir.fileName.toString() in setOf(".git", ".hg", ".svn", "all-in-one")) return FileVisitResult.SKIP_SUBTREE
                     return if (seenDirectories.add(dir)) FileVisitResult.CONTINUE else FileVisitResult.SKIP_SUBTREE
                 }
                 override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
-                    if (attrs.isRegularFile) scanFile(file, knownRegular = true)
+                    if (attrs.isRegularFile) scanFile(file)
                     return FileVisitResult.CONTINUE
                 }
                 override fun visitFileFailed(file: Path, exc: IOException): FileVisitResult {
@@ -148,6 +155,7 @@ internal object ClassExportService {
         }
 
         try {
+            scanDirectory(base)
             for (library in libraries.map { it.toAbsolutePath().normalize() }.distinct().sorted()) {
                 checkCanceled()
                 if (Files.isSymbolicLink(library)) continue
@@ -156,7 +164,6 @@ internal object ClassExportService {
                 } catch (e: Exception) { failure(sourceLabel(library), e) }
             }
             checkCanceled()
-            progress("依赖库扫描完成：$discovered 个 class，过滤 $filtered 个，待导出 ${items.size} 个", 0.3)
             archive = Files.createTempFile(destination.parent, ".jarlibs-export-", ".zip")
             val report = mutableListOf("zip_entry\tsource")
             val usedEntries = mutableSetOf<String>()

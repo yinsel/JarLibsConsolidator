@@ -14,6 +14,7 @@ import com.intellij.openapi.progress.ProgressManager
 import com.intellij.openapi.progress.Task
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.roots.ModuleRootManager
+import com.intellij.openapi.roots.LibraryOrderEntry
 import com.intellij.openapi.roots.OrderRootType
 import com.intellij.openapi.roots.libraries.LibraryTablesRegistrar
 import com.intellij.openapi.ui.DialogWrapper
@@ -52,12 +53,16 @@ internal abstract class BaseExportAction(private val javaSources: Boolean) : AnA
         ProgressManager.getInstance().run(object : Task.Backgroundable(project, if (javaSources) "反编译并导出 JAVA" else "导出 CLASS", true) {
             override fun run(indicator: ProgressIndicator) {
                 try {
+                    indicator.isIndeterminate = true
+                    indicator.text = "正在读取 IDEA 已登记的依赖库…"
                     val libraries = ReadAction.compute<List<Path>, RuntimeException> {
                         if (project.isDisposed) throw ProcessCanceledException()
                         val roots = LibraryTablesRegistrar.getInstance().getLibraryTable(project).libraries
                             .flatMap { it.getFiles(OrderRootType.CLASSES).asList() }.toMutableList()
                         for (module in ModuleManager.getInstance(project).modules) {
-                            roots.addAll(ModuleRootManager.getInstance(module).orderEntries().recursively().withoutSdk().classes().roots)
+                            ModuleRootManager.getInstance(module).orderEntries.filterIsInstance<LibraryOrderEntry>().forEach { entry ->
+                                entry.library?.getFiles(OrderRootType.CLASSES)?.let { roots.addAll(it) }
+                            }
                         }
                         roots.mapNotNull { root ->
                             val local = if (root.fileSystem.protocol == "jar") JarFileSystem.getInstance().getVirtualFileForJar(root) else root
@@ -66,7 +71,11 @@ internal abstract class BaseExportAction(private val javaSources: Boolean) : AnA
                     }
                     val result = ClassExportService.export(base, libraries, target, filter, decompiler(),
                         checkCanceled = { indicator.checkCanceled() },
-                        progress = { text, fraction -> indicator.text = text; indicator.fraction = fraction })
+                        progress = { text, fraction ->
+                            indicator.isIndeterminate = fraction < 0.3
+                            indicator.text = text
+                            if (fraction >= 0.3) indicator.fraction = fraction
+                        })
                     ApplicationManager.getApplication().invokeLater {
                         if (!project.isDisposed) {
                             val message = "已导出 ${result.exported} 个文件\n扫描 ${result.discovered} 个 class，过滤 ${result.filtered} 个，相同内容去重 ${result.duplicates} 个\n" +
@@ -101,7 +110,7 @@ private class ExportOptionsDialog(project: Project, javaSources: Boolean) : Dial
 
     override fun createCenterPanel(): JComponent {
         val panel = JPanel(BorderLayout(0, 12))
-        panel.add(JLabel("<html>范围：项目 class/JAR 及已配置的依赖库（不含 JDK）。<br>多条规则用换行或逗号分隔；区分大小写；黑名单优先。<br>" +
+        panel.add(JLabel("<html>请先一键添加依赖。导出范围：IDEA 已登记的依赖库（含 all-in-one，不含 JDK）。<br>不会扫描未加入依赖库的项目文件；库内嵌套 JAR 仍会读取。<br>多条规则用换行或逗号分隔；区分大小写；黑名单优先。<br>" +
                 "普通关键字：包名任意段或类名包含；com.example.*：该包及子包。<br>" +
                 "*example*：任意包名段包含；*example：任意段以 example 开头；example*：任意段以 example 结尾。</html>"), BorderLayout.NORTH)
         val fields = JPanel(GridLayout(1, 2, 12, 0))
