@@ -4,13 +4,12 @@ import org.junit.Assert.*
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
-import java.io.ByteArrayOutputStream
 import java.io.DataOutputStream
 import java.net.URLClassLoader
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.concurrent.CancellationException
-import javax.tools.ToolProvider
+import java.util.concurrent.TimeUnit
 
 class ClassFileCollectorTest {
     @get:Rule val temporary = TemporaryFolder()
@@ -21,11 +20,15 @@ class ClassFileCollectorTest {
         Files.writeString(javaFile, source)
         val destination = project.resolve(output)
         Files.createDirectories(destination)
-        val diagnostics = ByteArrayOutputStream()
-        val compiler = ToolProvider.getSystemJavaCompiler()
-        assertNotNull("Tests require a JDK", compiler)
-        val exit = compiler.run(null, diagnostics, diagnostics, "-encoding", "UTF-8", "-d", destination.toString(), javaFile.toString())
-        assertEquals(diagnostics.toString(), 0, exit)
+        val javac = checkNotNull(System.getProperty("test.javac")) { "Run tests through Gradle to select the fixture JDK" }
+        val diagnostics = sourceDir.resolve("javac.log")
+        val process = ProcessBuilder(javac, "--release", "17", "-encoding", "UTF-8", "-d", destination.toString(), javaFile.toString())
+            .redirectErrorStream(true).redirectOutput(diagnostics.toFile()).start()
+        if (!process.waitFor(30, TimeUnit.SECONDS)) {
+            process.destroyForcibly()
+            fail("javac timed out")
+        }
+        assertEquals(Files.readString(diagnostics), 0, process.exitValue())
         return destination
     }
 

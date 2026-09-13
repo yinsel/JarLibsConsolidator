@@ -32,10 +32,11 @@ dependencies {
 }
 tasks {
     test {
-        // These tests compile real bytecode; the IDE's bundled runtime may omit javac.
-        javaLauncher.set(project.extensions.getByType<org.gradle.jvm.toolchain.JavaToolchainService>().launcherFor {
+        // Use an external compiler: the IDE test runtime cannot expose it through ToolProvider.
+        val fixtureCompiler = project.extensions.getByType<org.gradle.jvm.toolchain.JavaToolchainService>().compilerFor {
             languageVersion.set(JavaLanguageVersion.of(17))
-        })
+        }
+        systemProperty("test.javac", fixtureCompiler.get().executablePath.asFile.absolutePath)
         testLogging {
             events("passed", "failed", "skipped")
             exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
