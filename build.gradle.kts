@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "org.le1a"
-version = providers.gradleProperty("pluginVersion").orElse("1.2").get()
+version = providers.gradleProperty("pluginVersion").orElse("1.3").get()
 
 repositories {
     mavenCentral()
@@ -19,6 +19,8 @@ repositories {
 }
 
 dependencies {
+    testImplementation("junit:junit:4.13.2")
+    testImplementation(kotlin("stdlib"))
     intellijPlatform {
         intellijIdeaUltimate("2024.1.6")
         bundledPlugins("com.intellij.java")
@@ -29,6 +31,18 @@ dependencies {
     }
 }
 tasks {
+    test {
+        // Use an external compiler: the IDE test runtime cannot expose it through ToolProvider.
+        val fixtureCompiler = project.extensions.getByType<org.gradle.jvm.toolchain.JavaToolchainService>().compilerFor {
+            languageVersion.set(JavaLanguageVersion.of(17))
+        }
+        systemProperty("test.javac", fixtureCompiler.get().executablePath.asFile.absolutePath)
+        testLogging {
+            events("passed", "failed", "skipped")
+            exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+        }
+    }
+
     // Set the JVM compatibility versions
     withType<JavaCompile> {
         sourceCompatibility = "17"

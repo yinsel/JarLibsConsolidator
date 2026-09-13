@@ -2,12 +2,14 @@ package org.le1a.jarlibsconsolidator
 
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
+import com.intellij.openapi.actionSystem.ActionUpdateThread
 import com.intellij.openapi.application.ApplicationInfo
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.WriteAction
 import com.intellij.openapi.module.ModuleManager
 import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.progress.ProgressManager
+import com.intellij.openapi.progress.ProcessCanceledException
 import com.intellij.openapi.progress.Task
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.roots.LibraryOrderEntry
@@ -17,14 +19,14 @@ import com.intellij.openapi.roots.libraries.Library
 import com.intellij.openapi.roots.libraries.LibraryTablesRegistrar
 import com.intellij.openapi.ui.Messages
 import com.intellij.openapi.vfs.LocalFileSystem
-import com.intellij.openapi.vfs.VirtualFile
 import com.intellij.openapi.vfs.JarFileSystem
 import java.io.File
 import java.nio.file.Files
+import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 
 /**
- * 一键添加jar依赖的Action类
+ * 一键添加 JAR 和 class 依赖的 Action
  * 兼容多个IDEA版本 (243.x - 251.x+)
  */
 class AddJarDependenciesAction : AnAction() {
@@ -65,24 +67,28 @@ class AddJarDependenciesAction : AnAction() {
 
             // 删除现有文件夹
             try {
-                allInOneDir.deleteRecursively()
+                if (!allInOneDir.deleteRecursively()) {
+                    throw RuntimeException("部分文件无法删除，请检查文件权限或占用情况")
+                }
             } catch (e: Exception) {
                 showError(project, "无法删除现有文件夹: ${e.message}")
                 return
             }
         }
 
-        ProgressManager.getInstance().run(object : Task.Backgroundable(project, "正在收集jar依赖...", true) {
+        ProgressManager.getInstance().run(object : Task.Backgroundable(project, "正在收集 JAR 和 class 依赖...", true) {
             override fun run(indicator: ProgressIndicator) {
                 try {
-                    indicator.text = "正在扫描jar文件..."
+                    indicator.text = "正在扫描 JAR 和 class 文件..."
                     indicator.fraction = 0.1
 
                     // 扫描jar文件
                     val jarFiles = findJarFiles(File(basePath), indicator)
+                    val classScan = ClassFileCollector.scan(Path.of(basePath)) { indicator.checkCanceled() }
 
-                    if (jarFiles.isEmpty()) {
-                        showInfo(project, "未找到任何jar文件")
+                    if (jarFiles.isEmpty() && classScan.classes.isEmpty()) {
+                        showInfo(project, "未找到可添加的 JAR 或 class 文件" +
+                                if (classScan.skipped.isEmpty()) "" else "\n跳过 ${classScan.skipped.size} 个无法读取的文件或目录")
                         return
                     }
 
@@ -94,25 +100,31 @@ class AddJarDependenciesAction : AnAction() {
                         throw RuntimeException("无法创建all-in-one目录")
                     }
 
-                    indicator.text = "正在复制jar文件..."
+                    indicator.text = "正在复制 JAR 和 class 文件..."
                     indicator.fraction = 0.5
 
                     // 复制文件
                     copyJarFiles(jarFiles, allInOneDir, indicator)
+                    val classRoots = ClassFileCollector.copy(classScan.classes, allInOneDir.toPath().resolve("classes")) {
+                        indicator.checkCanceled()
+                    }
+                    indicator.checkCanceled()
 
                     indicator.text = "正在添加到项目库..."
                     indicator.fraction = 0.8
 
-                    // 根据版本选择不同的添加方式
+                    val onSuccess = { showSuccess(project, jarFiles.size, classScan.classes.size, classScan.skipped.size) }
+                    // 只有库和模块依赖提交完成后才显示成功。
                     if (isNewThreadingModel) {
-                        addDirectoryToLibrary_New(project, allInOneDir)
+                        addDirectoryToLibrary_New(project, allInOneDir, classRoots, onSuccess)
                     } else {
-                        addDirectoryToLibrary_Old(project, allInOneDir)
+                        addDirectoryToLibrary_Old(project, allInOneDir, classRoots, onSuccess)
                     }
 
                     indicator.fraction = 1.0
-                    showSuccess(project, jarFiles.size)
 
+                } catch (e: ProcessCanceledException) {
+                    throw e
                 } catch (e: Exception) {
                     showError(project, "操作失败：${e.message}")
                 }
@@ -127,25 +139,27 @@ class AddJarDependenciesAction : AnAction() {
         val jarFiles = mutableListOf<File>()
 
         fun searchDirectory(dir: File) {
-            if (indicator.isCanceled) return
+            indicator.checkCanceled()
 
             try {
                 dir.listFiles()?.forEach { file ->
-                    if (indicator.isCanceled) return
+                    indicator.checkCanceled()
 
                     when {
                         file.isDirectory -> {
                             // 跳过常见的不需要搜索的目录，提高性能
-                            if (!shouldSkipDirectory(file.name)) {
+                            if (!Files.isSymbolicLink(file.toPath()) && !shouldSkipDirectory(file.name)) {
                                 searchDirectory(file)
                             }
                         }
-                        file.isFile && file.name.endsWith(".jar", ignoreCase = true) -> {
+                        file.isFile && !Files.isSymbolicLink(file.toPath()) && file.name.endsWith(".jar", ignoreCase = true) -> {
                             jarFiles.add(file)
                             indicator.text2 = "发现: ${file.name}"
                         }
                     }
                 }
+            } catch (e: ProcessCanceledException) {
+                throw e
             } catch (e: Exception) {
                 // 忽略无法访问的目录
             }
@@ -161,6 +175,7 @@ class AddJarDependenciesAction : AnAction() {
     private fun shouldSkipDirectory(dirName: String): Boolean {
         return dirName.startsWith(".") ||
                 dirName == "node_modules" ||
+                dirName == "all-in-one" ||
                 dirName == "target" ||
                 dirName == "build" ||
                 dirName == ".gradle" ||
@@ -174,7 +189,7 @@ class AddJarDependenciesAction : AnAction() {
         val nameCount = mutableMapOf<String, Int>()
 
         jarFiles.forEachIndexed { index, jarFile ->
-            if (indicator.isCanceled) return
+            indicator.checkCanceled()
 
             try {
                 // 处理重名文件
@@ -207,12 +222,14 @@ class AddJarDependenciesAction : AnAction() {
      * 2025.1+ 版本 (251+) 的库添加方法
      * 使用新的线程模型
      */
-    private fun addDirectoryToLibrary_New(project: Project, allInOneDir: File) {
+    private fun addDirectoryToLibrary_New(project: Project, allInOneDir: File, classRoots: List<Path>, onSuccess: () -> Unit) {
         ApplicationManager.getApplication().invokeLater {
+            if (project.isDisposed) return@invokeLater
             try {
                 WriteAction.run<RuntimeException> {
-                    performLibraryOperations(project, allInOneDir)
+                    performLibraryOperations(project, allInOneDir, classRoots)
                 }
+                onSuccess()
             } catch (e: Exception) {
                 ApplicationManager.getApplication().invokeLater {
                     Messages.showErrorDialog(project, "添加到项目库失败：${e.message}", "错误")
@@ -225,22 +242,24 @@ class AddJarDependenciesAction : AnAction() {
      * 2024.3及以下版本 (243及以下) 的库添加方法
      * 使用旧的线程模型
      */
-    private fun addDirectoryToLibrary_Old(project: Project, allInOneDir: File) {
+    private fun addDirectoryToLibrary_Old(project: Project, allInOneDir: File, classRoots: List<Path>, onSuccess: () -> Unit) {
         ApplicationManager.getApplication().invokeAndWait {
+            if (project.isDisposed) return@invokeAndWait
             ApplicationManager.getApplication().runWriteAction {
                 try {
-                    performLibraryOperations(project, allInOneDir)
+                    performLibraryOperations(project, allInOneDir, classRoots)
                 } catch (e: Exception) {
                     throw RuntimeException("添加到项目库失败：${e.message}")
                 }
             }
+            onSuccess()
         }
     }
 
     /**
      * 核心库操作逻辑，两个版本共用
      */
-    private fun performLibraryOperations(project: Project, allInOneDir: File) {
+    private fun performLibraryOperations(project: Project, allInOneDir: File, classRoots: List<Path>) {
         // 刷新文件系统
         LocalFileSystem.getInstance().refresh(false)
         val allInOneVirtualDir = LocalFileSystem.getInstance().refreshAndFindFileByIoFile(allInOneDir)
@@ -269,8 +288,8 @@ class AddJarDependenciesAction : AnAction() {
                 ?.filter { !it.isDirectory && it.extension?.equals("jar", true) == true }
                 ?: emptyList()
 
-            if (jarChildren.isEmpty()) {
-                throw RuntimeException("all-in-one目录中没有找到jar文件")
+            if (jarChildren.isEmpty() && classRoots.isEmpty()) {
+                throw RuntimeException("all-in-one目录中没有找到 JAR 或 class 文件")
             }
 
             jarChildren.forEach { vf ->
@@ -285,15 +304,20 @@ class AddJarDependenciesAction : AnAction() {
                 }
             }
 
-            libraryModel.commit()
+            classRoots.forEach { path ->
+                val root = LocalFileSystem.getInstance().refreshAndFindFileByIoFile(path.toFile())
+                    ?: throw RuntimeException("无法找到 class 库根目录: $path")
+                libraryModel.addRoot(root, OrderRootType.CLASSES)
+            }
 
-            // 将该项目库加入到所有模块依赖
-            addLibraryToAllModules(project, library)
+            libraryModel.commit()
 
         } catch (e: Exception) {
             libraryModel.dispose()
             throw e
         }
+        // A committed library model must not be disposed if attaching it to a module fails.
+        addLibraryToAllModules(project, library)
     }
 
     /**
@@ -351,12 +375,14 @@ class AddJarDependenciesAction : AnAction() {
         }
     }
 
-    private fun showSuccess(project: Project, count: Int) {
+    private fun showSuccess(project: Project, jarCount: Int, classCount: Int, skippedCount: Int) {
         ApplicationManager.getApplication().invokeLater {
             val versionInfo = if (isNewThreadingModel) "2025.1+" else "2024.3-"
             Messages.showInfoMessage(
                 project,
-                "成功处理了 $count 个jar文件\n所有jar包依赖已添加为库\n(兼容模式: $versionInfo)",
+                "成功处理了 $jarCount 个 JAR 文件和 $classCount 个 class 文件\n依赖已添加为库并关联所有模块" +
+                        (if (skippedCount == 0) "" else "\n跳过 $skippedCount 个无法读取的文件或目录") +
+                        "\n(兼容模式: $versionInfo)",
                 "操作完成"
             )
         }
@@ -365,4 +391,6 @@ class AddJarDependenciesAction : AnAction() {
     override fun update(e: AnActionEvent) {
         e.presentation.isEnabledAndVisible = e.project != null
     }
+
+    override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.BGT
 }

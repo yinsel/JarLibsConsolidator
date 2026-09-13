@@ -17,17 +17,18 @@
          Simple HTML elements (text formatting, paragraphs, and lists) can be added inside of <![CDATA[ ]]> tag.
          Guidelines: https://plugins.jetbrains.com/docs/marketplace/plugin-overview-page.html#plugin-description -->
     <description><![CDATA[
-    A one-click tool plugin for collecting and consolidating all JAR dependencies in your project. This plugin recursively scans your project directory to find all JAR files, copies them to an "all-in-one" folder, and automatically adds them as project libraries attached to all modules.<br><br>
+    A one-click tool plugin for collecting JAR dependencies and loose .class files in your project. It copies JARs to an "all-in-one" folder, restores class package paths from bytecode, and adds the JAR and class roots as a project library attached to all modules.<br><br>
     
     <strong>Features:</strong><br>
     • One-click operation: Right-click project → Select "Add Dependencies"<br>
     • Smart scanning: Recursively scans .jar files, skipping common directories (node_modules, target, build, .gradle, .mvn, etc.)<br>
     • Duplicate handling: Automatically renames duplicate JARs with suffixes (x.jar → x_2.jar)<br>
     • Unified management: Copies to all-in-one/ directory and creates project-level library<br>
+    • Loose class files: Includes build outputs, restores package paths, and supports projects without JARs<br>
     • Declared IDE compatibility: IntelliJ IDEA builds 223–262.* (including IU-262.10315.125)<br><br>
     
     <strong>中文说明：</strong><br>
-    一键收集项目中所有jar包依赖的工具插件。遍历项目目录收集所有jar文件，复制到all-in-one文件夹，并自动添加为项目库。<br><br>
+    一键收集项目中的 JAR 和独立 class 文件。按字节码包名整理 class 目录，复制到 all-in-one 文件夹，自动加入项目库并关联所有模块，让 IDEA 能识别这些类。<br><br>
     
     Project URL: <a href="https://github.com/Le1a/JarLibsConsolidator">https://github.com/Le1a/JarLibsConsolidator</a>
   ]]></description>
@@ -47,7 +48,7 @@
         <action id="org.le1a.jarlibsconsolidator.AddJarDependenciesAction"
                 class="org.le1a.jarlibsconsolidator.AddJarDependenciesAction"
                 text="一键添加依赖"
-                description="将项目中所有jar包依赖添加为库">
+                description="将项目中的 JAR 和 class 文件添加为库">
             <add-to-group group-id="ProjectViewPopupMenu" anchor="last"/>
         </action>
     </actions>
