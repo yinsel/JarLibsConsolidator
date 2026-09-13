@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "org.le1a"
-version = providers.gradleProperty("pluginVersion").orElse("1.4").get()
+version = providers.gradleProperty("pluginVersion").orElse("1.5.2").get()
 
 repositories {
     mavenCentral()
@@ -23,7 +23,7 @@ dependencies {
     testImplementation(kotlin("stdlib"))
     intellijPlatform {
         intellijIdeaUltimate("2024.1.6")
-        bundledPlugins("com.intellij.java")
+        bundledPlugins("com.intellij.java", "org.jetbrains.java.decompiler")
         
         pluginVerifier()
         zipSigner()
@@ -37,7 +37,14 @@ tasks {
             languageVersion.set(JavaLanguageVersion.of(17))
         }
         systemProperty("test.javac", fixtureCompiler.get().executablePath.asFile.absolutePath)
+        systemProperty("benchmark.exports", providers.gradleProperty("benchmarkExports").orElse("false").get())
+        if (providers.gradleProperty("benchmarkExports").orElse("false").get().toBoolean()) {
+            systemProperty("benchmark.junitJar", project.configurations.getByName("testRuntimeClasspath")
+                .files.single { it.name == "junit-4.13.2.jar" }.absolutePath)
+        }
+        maxHeapSize = "1g"
         testLogging {
+            showStandardStreams = providers.gradleProperty("benchmarkExports").orElse("false").get().toBoolean()
             events("passed", "failed", "skipped")
             exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
         }

@@ -2,6 +2,7 @@ package org.le1a.jarlibsconsolidator
 
 import java.io.DataInputStream
 import java.io.IOException
+import java.io.InputStream
 import java.nio.file.FileVisitResult
 import java.nio.file.Files
 import java.nio.file.Path
@@ -127,7 +128,12 @@ internal object ClassFileCollector {
     }
 
     // JVMS 4.1/4.4: read this_class through the constant pool, independently of classfile version.
-    private fun readInternalName(file: Path): String = DataInputStream(Files.newInputStream(file).buffered()).use { input ->
+    internal fun readInternalName(file: Path): String = readInternalName(Files.newInputStream(file))
+
+    internal fun readInternalName(stream: InputStream): String = DataInputStream(stream.buffered()).use { readInternalName(it) }
+
+    /** Leaves the caller's stream open, so export can rewind the buffered header without reopening the entry. */
+    internal fun readInternalName(input: DataInputStream): String {
         if (input.readInt() != 0xCAFEBABE.toInt()) throw IOException("Invalid class magic")
         input.readUnsignedShort() // minor_version
         input.readUnsignedShort() // major_version
@@ -155,6 +161,6 @@ internal object ClassFileCollector {
             name.any { it in "\\:;[\u0000" }) {
             throw IOException("Unsafe class name")
         }
-        name
+        return name
     }
 }
