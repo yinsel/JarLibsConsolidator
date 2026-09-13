@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "org.le1a"
-version = providers.gradleProperty("pluginVersion").orElse("1.3").get()
+version = providers.gradleProperty("pluginVersion").orElse("1.4").get()
 
 repositories {
     mavenCentral()

@@ -7,10 +7,12 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.SimpleFileVisitor
 import java.nio.file.attribute.BasicFileAttributes
+import java.security.MessageDigest
+import java.util.Locale
 
 /** Collect loose bytecode without loading or executing any of the project's classes. */
 internal object ClassFileCollector {
-    data class ClassFile(val source: Path, val relativePath: Path, val sourceRoot: Path)
+    data class ClassFile(val source: Path, val relativePath: Path, val sourceRoot: Path, val projectRoot: Path)
     data class ScanResult(val classes: List<ClassFile>, val skipped: List<Path>)
 
     fun scan(project: Path, checkCanceled: () -> Unit = {}): ScanResult {
@@ -31,13 +33,14 @@ internal object ClassFileCollector {
                 if (attrs.isRegularFile && file.fileName.toString().endsWith(".class", ignoreCase = true)) {
                     try {
                         val relative = Path.of(readInternalName(file) + ".class")
-                        // Keep distinct module/output roots separate, even when they contain the same class.
+                        // Retain the original output folder for naming genuinely conflicting versions.
                         var sourceRoot = file.parent
                         if (file.endsWith(relative)) {
                             sourceRoot = file
                             repeat(relative.nameCount) { sourceRoot = sourceRoot.parent }
                         }
-                        classes.add(ClassFile(file, relative, sourceRoot))
+                        if (!sourceRoot.startsWith(base)) sourceRoot = file.parent
+                        classes.add(ClassFile(file, relative, sourceRoot, base))
                     } catch (_: IOException) {
                         skipped.add(file)
                     }
@@ -54,24 +57,73 @@ internal object ClassFileCollector {
         return ScanResult(classes.sortedBy { it.source.toString() }, skipped)
     }
 
-    /** Returns the exact classpath roots to register with OrderRootType.CLASSES. */
+    /** Merge unique bytecode into output; keep different versions in sibling, source-named roots. */
     fun copy(classes: List<ClassFile>, output: Path, checkCanceled: () -> Unit = {}): List<Path> {
-        val roots = mutableListOf<Path>()
+        val conflictDirectory = output.resolveSibling("${output.fileName}-conflicts")
+        val roots = linkedSetOf<Path>()
         val rootsBySource = linkedMapOf<Path, MutableList<Path>>()
-        for (entry in classes) {
-            checkCanceled()
+        val usedNames = mutableSetOf("sources.tsv")
+        val conflictSources = mutableListOf("library_root\tclass_path\tsource_file")
+
+        fun safeName(value: String): String = value.replace(Regex("[^\\p{L}\\p{N}._-]"), "_")
+            .trim('.', '_').ifEmpty { "project" }
+
+        fun conflictRoot(entry: ClassFile): Path {
             val candidates = rootsBySource.getOrPut(entry.sourceRoot) { mutableListOf() }
-            val root = candidates.firstOrNull { !Files.exists(it.resolve(entry.relativePath)) }
-                ?: output.resolve("root-${roots.size + 1}").also {
-                    roots.add(it)
-                    candidates.add(it)
-                }
-            val target = root.resolve(entry.relativePath)
-            Files.createDirectories(target.parent)
-            // Class names must never be renamed: their binary names are encoded in the bytecode.
-            Files.copy(entry.source, target)
+            candidates.firstOrNull { !Files.exists(it.resolve(entry.relativePath)) }?.let { return it }
+            val relativeSource = entry.projectRoot.relativize(entry.sourceRoot)
+            val folder = if (relativeSource.toString().isEmpty()) entry.projectRoot.fileName.toString()
+                else relativeSource.joinToString("__") { it.toString() }
+            // A renamed class can have another binary version in the very same source folder.
+            val label = safeName(folder + if (candidates.isEmpty()) "" else "__from-${entry.source.fileName}")
+            val origin = entry.projectRoot.relativize(entry.source).toString()
+            val digest = MessageDigest.getInstance("SHA-256").digest(origin.toByteArray(Charsets.UTF_8))
+                .joinToString("") { "%02x".format(it) }
+            var shortLabel = label
+            while (shortLabel.toByteArray(Charsets.UTF_8).size > 120) {
+                shortLabel = shortLabel.substring(0, shortLabel.offsetByCodePoints(shortLabel.length, -1))
+            }
+            var name = shortLabel
+            if (shortLabel != label || name.lowercase(Locale.ROOT) in usedNames) {
+                name = "$shortLabel--${digest.take(12)}"
+            }
+            if (!usedNames.add(name.lowercase(Locale.ROOT))) {
+                name = "$shortLabel--$digest"
+                check(usedNames.add(name.lowercase(Locale.ROOT))) { "Conflicting source directory names: $origin" }
+            }
+            return conflictDirectory.resolve(name).also { candidates.add(it) }
         }
-        return roots
+
+        // Sorting makes both representative selection and root ordering independent of traversal order.
+        val groups = classes.sortedBy { it.source.toString() }.groupBy { it.relativePath }
+        for (entries in groups.values) {
+            checkCanceled()
+            val versions = mutableListOf<ClassFile>()
+            for (entry in entries) {
+                checkCanceled()
+                val identical = versions.any {
+                    checkCanceled()
+                    Files.mismatch(it.source, entry.source) == -1L
+                }
+                if (!identical) versions.add(entry)
+            }
+            for (entry in versions) {
+                checkCanceled()
+                val root = if (versions.size == 1) output else conflictRoot(entry)
+                val target = root.resolve(entry.relativePath)
+                Files.createDirectories(target.parent)
+                Files.copy(entry.source, target)
+                roots.add(root)
+                if (versions.size > 1) {
+                    conflictSources.add(listOf(root.fileName.toString(), entry.relativePath.toString(),
+                        entry.projectRoot.relativize(entry.source).toString()).joinToString("\t") {
+                        it.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
+                    })
+                }
+            }
+        }
+        if (conflictSources.size > 1) Files.write(conflictDirectory.resolve("sources.tsv"), conflictSources)
+        return listOf(output).filter { it in roots } + roots.filter { it != output }
     }
 
     // JVMS 4.1/4.4: read this_class through the constant pool, independently of classfile version.
