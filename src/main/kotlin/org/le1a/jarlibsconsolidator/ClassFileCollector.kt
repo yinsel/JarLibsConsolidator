@@ -3,6 +3,8 @@ package org.le1a.jarlibsconsolidator
 import java.io.DataInputStream
 import java.io.IOException
 import java.io.InputStream
+import java.nio.file.FileAlreadyExistsException
+import java.nio.file.LinkOption
 import java.nio.file.FileVisitResult
 import java.nio.file.Files
 import java.nio.file.Path
@@ -99,7 +101,10 @@ internal object ClassFileCollector {
         }
 
         // Sorting makes both representative selection and root ordering independent of traversal order.
-        val groups = classes.sortedBy { it.source.toString() }.groupBy { it.relativePath }
+        // Binary names are case-sensitive even when the host Path implementation is not.
+        val groups = classes.sortedBy { it.source.toString() }.groupBy { entry ->
+            entry.relativePath.joinToString("/") { it.toString() }
+        }
         for (entries in groups.values) {
             checkCanceled()
             val versions = mutableListOf<ClassFile>()
@@ -115,15 +120,36 @@ internal object ClassFileCollector {
             }
             for (entry in versions) {
                 checkCanceled()
-                val root = if (versions.size == 1) output else conflictRoot(entry)
-                val target = root.resolve(entry.relativePath)
+                var root = if (versions.size == 1) output else conflictRoot(entry)
+                var target = root.resolve(entry.relativePath)
                 PluginDiagnostics.debug { "Copy class: name=${entry.relativePath}, source=${entry.source}, target=$target, versions=${versions.size}" }
                 PluginDiagnostics.io({ "复制 class 失败: source=${entry.source}, target=$target" }) {
                     Files.createDirectories(target.parent)
-                    Files.copy(entry.source, target)
+                    try {
+                        // The copy itself detects collisions, including case aliases and late arrivals.
+                        Files.copy(entry.source, target)
+                    } catch (collision: FileAlreadyExistsException) {
+                        checkCanceled()
+                        // Do not follow an unexpected link or interpret a directory as bytecode.
+                        if (!Files.isRegularFile(target, LinkOption.NOFOLLOW_LINKS)) throw collision
+                        if (Files.mismatch(entry.source, target) == -1L) {
+                            PluginDiagnostics.debug { "Reuse identical existing class: source=${entry.source}, target=$target" }
+                        } else {
+                            // Preserve the existing file and register its root as well as the new one.
+                            // Never rename an existing file: another task/process may own it.
+                            roots.add(root)
+                            val existing = target
+                            root = conflictRoot(entry)
+                            target = root.resolve(entry.relativePath)
+                            PluginDiagnostics.warn("Class target collision: source=${entry.source}, existing=$existing, preservedAs=$target", collision)
+                            checkCanceled()
+                            Files.createDirectories(target.parent)
+                            Files.copy(entry.source, target)
+                        }
+                    }
                 }
                 roots.add(root)
-                if (versions.size > 1) {
+                if (root != output) {
                     conflictSources.add(listOf(root.fileName.toString(), entry.relativePath.toString(),
                         entry.projectRoot.relativize(entry.source).toString()).joinToString("\t") {
                         it.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")

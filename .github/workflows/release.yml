@@ -77,6 +77,31 @@ jobs:
         if: github.event_name == 'pull_request'
         run: ./gradlew --no-daemon test --tests '*ExportBenchmarkTest' --tests '*ScanBenchmarkTest' -PbenchmarkExports=true
 
+  windows-class-copy:
+    if: github.event_name == 'pull_request'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+      - name: Check existing targets and case collisions on Windows
+        shell: bash
+        run: >-
+          ./gradlew --no-daemon test
+          --tests '*ClassFileCollectorTest.existing different target*'
+          --tests '*ClassFileCollectorTest.repeated copy*'
+          --tests '*ClassFileCollectorTest.case distinct binary names*'
+          --tests '*ClassFileCollectorTest.missing source failure*'
+
   release:
     if: github.event_name == 'workflow_dispatch'
     needs: build
