@@ -21,7 +21,8 @@ class ExportBenchmarkTest {
 
     @Test fun `compare frozen serial baseline with cold parallel and warm cache exports`() {
         assumeTrue(java.lang.Boolean.getBoolean("benchmark.exports"))
-        val junit = Path.of(org.junit.Test::class.java.protectionDomain.codeSource.location.toURI())
+        // IntelliJ's test classloader does not expose CodeSource locations reliably.
+        val junit = Path.of(System.getProperty("benchmark.junitJar"))
         assertTrue("Benchmark requires the real JUnit dependency JAR", Files.isRegularFile(junit))
         val fatJar = fixtureFatJar()
         val workers = OrderedParallelDecompiler.defaultParallelism()

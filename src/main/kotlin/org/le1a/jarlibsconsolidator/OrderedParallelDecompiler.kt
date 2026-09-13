@@ -65,7 +65,10 @@ internal class OrderedParallelDecompiler(
             consumed++
             if (!future.isDone) future.cancel(true)
             // Cancellation must not start another class.
-            if (!stopped.get() && !future.isCancelled) submit()
+            if (!stopped.get() && !future.isCancelled) {
+                checkCanceled()
+                submit()
+            }
         }
     }
 
