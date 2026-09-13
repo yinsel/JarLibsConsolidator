@@ -9,7 +9,7 @@ import java.util.concurrent.CancellationException
 
 /** A stable category for IDEA's Debug Log Settings; never log bytecode or source contents. */
 internal object PluginDiagnostics {
-    private val log by lazy { Logger.getInstance("org.le1a.jarlibsconsolidator") }
+    private val log by lazy { Logger.getInstance("#org.le1a.jarlibsconsolidator") }
 
     fun info(message: String) = log.info(message)
     fun warn(message: String, cause: Throwable? = null) = log.warn(message, cause)
