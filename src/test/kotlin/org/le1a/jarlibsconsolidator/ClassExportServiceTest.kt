@@ -102,7 +102,7 @@ class ClassExportServiceTest {
         assertEquals(1, result.duplicates)
         val classEntries = entries(target).keys.filter { it.endsWith(".class") }
         assertEquals(2, classEntries.size)
-        assertTrue(classEntries.all { it.startsWith("conflicts/") && it.endsWith("demo/Same.class") })
+        assertTrue(classEntries.all { it.startsWith("classes-conflicts/") && it.endsWith("demo/Same.class") })
     }
 
     @Test fun `IDEA bundled decompiler emits method bodies from jar bytecode`() {
@@ -127,8 +127,8 @@ class ClassExportServiceTest {
         assertEquals(result.failures.toString(), 2, result.exported)
         val sources = entries(target).filterKeys { it.endsWith(".java") }
         assertEquals(2, sources.size)
-        assertTrue(sources.any { (name, bytes) -> name.startsWith("conflicts/first.jar--") && "return 1;" in bytes.toString(Charsets.UTF_8) })
-        assertTrue(sources.any { (name, bytes) -> name.startsWith("conflicts/second.jar--") && "return 2;" in bytes.toString(Charsets.UTF_8) })
+        assertTrue(sources.any { (name, bytes) -> name.startsWith("classes-conflicts/first.jar--") && "return 1;" in bytes.toString(Charsets.UTF_8) })
+        assertTrue(sources.any { (name, bytes) -> name.startsWith("classes-conflicts/second.jar--") && "return 2;" in bytes.toString(Charsets.UTF_8) })
     }
 
     @Test fun `inner classes export separately and blacklisted inner content cannot leak`() {

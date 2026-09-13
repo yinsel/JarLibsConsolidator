@@ -172,7 +172,7 @@ internal object ClassExportService {
                         val extension = if (decompiler == null) "class" else "java"
                         val prefix = if (versions.getValue(item.name).size == 1) "" else {
                             val label = item.group.replace(Regex("[^\\p{L}\\p{N}._-]"), "_").take(50).ifEmpty { "project" }
-                            "conflicts/$label--${item.digest.take(16)}/"
+                            "classes-conflicts/$label--${item.digest.take(16)}/"
                         }
                         val entryName = "$prefix${item.name}.$extension"
                         val source = try {
