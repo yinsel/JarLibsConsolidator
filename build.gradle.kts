@@ -38,11 +38,9 @@ tasks {
         }
         systemProperty("test.javac", fixtureCompiler.get().executablePath.asFile.absolutePath)
         systemProperty("benchmark.exports", providers.gradleProperty("benchmarkExports").orElse("false").get())
-        doFirst {
-            if (systemProperties["benchmark.exports"] == "true") {
-                systemProperty("benchmark.junitJar", project.configurations.getByName("testRuntimeClasspath")
-                    .files.single { it.name == "junit-4.13.2.jar" }.absolutePath)
-            }
+        if (providers.gradleProperty("benchmarkExports").orElse("false").get().toBoolean()) {
+            systemProperty("benchmark.junitJar", project.configurations.getByName("testRuntimeClasspath")
+                .files.single { it.name == "junit-4.13.2.jar" }.absolutePath)
         }
         maxHeapSize = "1g"
         testLogging {
