@@ -25,6 +25,7 @@
     • Duplicate handling: Automatically renames duplicate JARs with suffixes (x.jar → x_2.jar)<br>
     • Unified management: Copies to all-in-one/ directory and creates project-level library<br>
     • Loose class files: Includes build outputs, restores package paths, and supports projects without JARs<br>
+    • ZIP export: Exports CLASS or JAVA sources from project files and dependency JARs with allow/deny filters; JAVA uses IDEA's bundled decompiler<br>
     • Declared IDE compatibility: IntelliJ IDEA builds 223–262.* (including IU-262.10315.125)<br><br>
     
     <strong>中文说明：</strong><br>
@@ -36,6 +37,7 @@
     <!-- Product and plugin compatibility requirements.
          Read more: https://plugins.jetbrains.com/docs/intellij/plugin-compatibility.html -->
     <depends>com.intellij.modules.platform</depends>
+    <depends optional="true" config-file="java-export.xml">org.jetbrains.java.decompiler</depends>
 
     <!-- Extension points defined by the plugin.
          Read more: https://plugins.jetbrains.com/docs/intellij/plugin-extension-points.html -->
@@ -45,6 +47,12 @@
 
     <!-- Plugin actions -->
     <actions>
+        <action id="org.le1a.jarlibsconsolidator.ExportClassesAction"
+                class="org.le1a.jarlibsconsolidator.ExportClassesAction"
+                text="一键导出 CLASS（ZIP）"
+                description="按白名单和黑名单导出项目及依赖 JAR 中的 class 文件">
+            <add-to-group group-id="ProjectViewPopupMenu" anchor="last"/>
+        </action>
         <action id="org.le1a.jarlibsconsolidator.AddJarDependenciesAction"
                 class="org.le1a.jarlibsconsolidator.AddJarDependenciesAction"
                 text="一键添加依赖"

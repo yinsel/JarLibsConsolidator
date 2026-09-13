@@ -97,6 +97,31 @@ class 扫描跳过版本控制目录（`.git`、`.hg`、`.svn`）和已有 `all-
 2. JAR 复制到 `all-in-one/`；class 按完整类名分组并比较字节内容，不冲突或内容相同的类统一整理到 `all-in-one/classes/`，内容不同的同名类放入按来源命名的冲突根目录。
 3. 创建/刷新项目库 `all-in-one`，将 JAR 根和 class 包目录的根分别注册为 `CLASSES`，并添加到所有模块依赖。
 
+### 导出 CLASS / 反编译导出 JAVA（ZIP）
+
+在项目视图右键菜单中选择 **一键导出 CLASS（ZIP）** 或 **一键反编译并导出 JAVA（ZIP）**，输入白名单、黑名单，再选择 ZIP 保存位置。
+
+导出范围包含项目目录中的独立 class、JAR，以及 IDEA 已配置的项目库和模块依赖（包含项目外的 Maven/Gradle 依赖，不包含 JDK）。JAR 内直接存放的类、多版本条目和嵌套依赖 JAR 都会扫描。项目遍历跳过版本控制目录和已有 `all-in-one` 输出；已作为库添加的 `all-in-one` 根目录仍会通过依赖列表纳入导出。不会跟随文件系统符号链接。
+
+JAVA 导出调用 **当前 IDEA 自带的 Java Bytecode Decompiler（Fernflower）引擎**，不额外下载或内置第三方反编译器。需要启用 IDEA 的 Java Bytecode Decompiler 插件；关闭它时，JAVA 导出菜单隐藏，CLASS 导出仍可用。反编译会生成方法体，不使用仅含签名的 class 查看器存根。源码不保证与原始源码完全一致或能直接构建；内部类单独导出，以严格遵守类名过滤规则。
+
+两种导出共用以下规则：多条规则用换行、英文逗号或中文逗号分隔，区分大小写；白名单为空表示全部，非空时命中任意一条即可；**黑名单优先，命中即排除**。
+
+| 规则 | 含义 | 示例 |
+| --- | --- | --- |
+| `Service` | 包名任意一段或简单类名包含关键字 | `com.api.UserService` |
+| `com.example` | 完整包名精确匹配 | `com.example.User`，不含子包 |
+| `com.example.*` | 指定包及子包 | `com.example.User`、`com.example.api.User` |
+| `*example*` | 任意包名段包含 `example` | `org.myexampletools.api.User` |
+| `*example` | 任意包名段以 `example` 开头 | `org.exampletools.api.User` |
+| `example*` | 任意包名段以 `example` 结尾 | `org.myexample.api.User` |
+
+单段规则中，前置/后置 `*` 的方向按本项目约定执行，与通常的 glob 方向相反。其他组合中 `*` 表示任意字符，`?` 表示单个字符；带点的包路径规则匹配完整包名。匹配依据是字节码里的真实包名，而不是 JAR 条目或磁盘文件夹名。
+
+普通条目按包路径导出，例如 `com/example/User.class` 或 `com/example/User.java`。相同完整类名和相同字节内容去重；同名但内容不同的版本全部保留在 `conflicts/来源名称--字节摘要/` 下，不会互相覆盖。JAVA 导出也按原始字节码判断版本，反编译失败的版本会列入报告。
+
+ZIP 内包含 `export-report.txt`（扫描、过滤、去重、导出计数和失败/警告列表）以及 `export-sources.tsv`（导出文件对应的来源）。导出可取消；先完成临时 ZIP，再替换目标文件，取消或打包失败不会覆盖已有文件。为限制异常输入的资源消耗，单个 class 上限 64 MiB，嵌套 JAR 上限 512 MiB、最多递归 8 层，超出部分会报告为失败/警告。
+
 ### 兼容性与要求
 - **IDE 声明范围**：build `223`–`262.*`（包含 `IU-262.10315.125`），保留原最低版本 `223`。
 - **编译基线**：IntelliJ IDEA Ultimate 2024.1.6；扩大版本范围解决安装时的版本上限拦截，不代表已经在所有 IDE 版本上完成运行验证。

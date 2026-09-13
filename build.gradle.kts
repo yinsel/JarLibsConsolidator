@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "org.le1a"
-version = providers.gradleProperty("pluginVersion").orElse("1.4").get()
+version = providers.gradleProperty("pluginVersion").orElse("1.5").get()
 
 repositories {
     mavenCentral()
@@ -23,7 +23,7 @@ dependencies {
     testImplementation(kotlin("stdlib"))
     intellijPlatform {
         intellijIdeaUltimate("2024.1.6")
-        bundledPlugins("com.intellij.java")
+        bundledPlugins("com.intellij.java", "org.jetbrains.java.decompiler")
         
         pluginVerifier()
         zipSigner()
