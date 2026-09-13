@@ -212,20 +212,72 @@ class ClassFileCollectorTest {
         }
     }
 
-    @Test fun `copy failure retains both paths and original filesystem cause without overwriting`() {
+    @Test fun `existing different target is preserved and incoming class uses source named conflict root`() {
+        val project = temporary.newFolder().toPath()
+        val incoming = compile(project, "libs/classes/sign", "AuthCallBackController",
+            "package com.qiyuesuo.callback; public class AuthCallBackController { public static int value() { return 2; } }")
+        val existing = compile(project, "previous", "AuthCallBackController",
+            "package com.qiyuesuo.callback; public class AuthCallBackController { public static int value() { return 1; } }")
+        val relative = Path.of("com/qiyuesuo/callback/AuthCallBackController.class")
+        val output = project.resolve("all-in-one/classes")
+        Files.createDirectories(output.resolve(relative).parent)
+        Files.copy(existing.resolve(relative), output.resolve(relative))
+        val entry = ClassFileCollector.ClassFile(incoming.resolve(relative), relative, incoming, project)
+        val roots = ClassFileCollector.copy(listOf(entry), output)
+        assertEquals(listOf(output, project.resolve("all-in-one/classes-conflicts/libs__classes__sign")), roots)
+        assertArrayEquals(Files.readAllBytes(existing.resolve(relative)), Files.readAllBytes(output.resolve(relative)))
+        assertArrayEquals(Files.readAllBytes(incoming.resolve(relative)), Files.readAllBytes(roots[1].resolve(relative)))
+        assertTrue(Files.readString(project.resolve("all-in-one/classes-conflicts/sources.tsv")).contains("libs__classes__sign"))
+        val values = roots.map { root -> URLClassLoader(arrayOf(root.toUri().toURL()), null).use {
+            it.loadClass("com.qiyuesuo.callback.AuthCallBackController").getMethod("value").invoke(null)
+        } }
+        assertEquals(listOf(1, 2), values)
+    }
+
+    @Test fun `repeated copy reuses identical existing class without creating conflict roots`() {
+        val project = temporary.newFolder().toPath()
+        compile(project, "libs", "Example", "package demo; public class Example {}")
+        val classes = ClassFileCollector.scan(project).classes
+        val output = project.resolve("all-in-one/classes")
+        assertEquals(listOf(output), ClassFileCollector.copy(classes, output))
+        assertEquals(listOf(output), ClassFileCollector.copy(classes, output))
+        assertFalse(Files.exists(project.resolve("all-in-one/classes-conflicts")))
+    }
+
+    @Test fun `case distinct binary names retain both original bytecodes`() {
+        val project = temporary.newFolder().toPath()
+        val first = compile(project, "first", "AuthCallbackController",
+            "package demo; public class AuthCallbackController {}")
+        val second = compile(project, "second", "AuthCallBackController",
+            "package demo; public class AuthCallBackController {}")
+        val classes = ClassFileCollector.scan(project).classes
+        val roots = ClassFileCollector.copy(classes, project.resolve("all-in-one/classes"))
+        // Works on either case-sensitive or case-insensitive disks; compare actual bytecode names.
+        val copied = roots.flatMap { root -> Files.walk(root).use { files ->
+            files.filter { Files.isRegularFile(it) && it.toString().endsWith(".class") }.toList()
+        } }.associateBy { ClassFileCollector.readInternalName(it) }
+        assertEquals(setOf("demo/AuthCallbackController", "demo/AuthCallBackController"), copied.keys)
+        assertArrayEquals(Files.readAllBytes(first.resolve("demo/AuthCallbackController.class")),
+            Files.readAllBytes(copied.getValue("demo/AuthCallbackController")))
+        assertArrayEquals(Files.readAllBytes(second.resolve("demo/AuthCallBackController.class")),
+            Files.readAllBytes(copied.getValue("demo/AuthCallBackController")))
+    }
+
+    @Test fun `missing source failure retains both paths and original filesystem cause`() {
         val project = temporary.newFolder().toPath()
         val source = Files.write(project.resolve("input.class"), byteArrayOf(1, 2, 3))
         val output = project.resolve("all-in-one/classes")
         val target = output.resolve("demo/Existing.class")
         Files.createDirectories(target.parent)
         Files.write(target, byteArrayOf(9))
+        Files.delete(source)
         val entry = ClassFileCollector.ClassFile(source, Path.of("demo/Existing.class"), project, project)
         val error = assertThrows(java.io.IOException::class.java) {
             ClassFileCollector.copy(listOf(entry), output)
         }
         assertTrue(error.message!!.contains(source.toString()))
         assertTrue(error.message!!.contains(target.toString()))
-        assertTrue(error.cause is java.nio.file.FileAlreadyExistsException)
+        assertTrue(error.cause is java.nio.file.NoSuchFileException)
         assertArrayEquals(byteArrayOf(9), Files.readAllBytes(target))
     }
 

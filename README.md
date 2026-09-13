@@ -88,6 +88,8 @@ cp `find ./ -name "*.jar"` ./all-in-one
 
 如果 `module-a/target/classes` 和 `module-b/target/classes` 都有 `com.example.App`，但字节内容不同，两个版本分别放在 `classes-conflicts/module-a__target__classes/com/example/App.class` 和 `classes-conflicts/module-b__target__classes/com/example/App.class`，不在公共 `classes/` 中任意保留一个版本。相同内容的副本不会增加额外库根。
 
+从 1.5.4 起，复制时还会处理磁盘上实际已存在的目标（包括文件系统不区分大小写造成的冲突）：字节完全相同则复用；内容不同则保留既有文件，将新文件放进 `classes-conflicts/` 下按来源命名的库根，并同时注册两处库根。新文件来源记入 `sources.tsv`，日志记录源文件、既有目标及实际保存路径。不覆盖、不删除既有文件；目录、符号链接或权限错误仍会报告异常。完整类名分组严格区分大小写。
+
 冲突根目录用项目内相对来源路径命名，路径分隔符替换为 `__`；同一文件夹内的不同版本会附加原始文件名。目录名重名或过长时附加来源路径摘要，`classes-conflicts/sources.tsv` 记录所保留版本的完整原始相对路径。冲突根放在公共 `classes/` 之外，避免来源目录被误识别为包名。
 
 class 扫描跳过版本控制目录（`.git`、`.hg`、`.svn`）和已有 `all-in-one` 输出，不跟随符号链接。无法读取或头部无效的 class 文件会被跳过，完成提示中会显示跳过数量。
