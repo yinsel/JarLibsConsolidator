@@ -8,7 +8,7 @@
     <name>JarLibsConsolidator</name>
 
     <!-- 设置兼容版本范围 -->
-    <idea-version since-build="223" until-build="253.*"/>
+    <idea-version since-build="223" until-build="262.*"/>
 
     <!-- A displayed Vendor name or Organization ID displayed on the Plugins Page. -->
     <vendor email="le1a.github.io@gmail.com" url="https://le1a.github.io/">Le1a</vendor>
@@ -24,7 +24,7 @@
     • Smart scanning: Recursively scans .jar files, skipping common directories (node_modules, target, build, .gradle, .mvn, etc.)<br>
     • Duplicate handling: Automatically renames duplicate JARs with suffixes (x.jar → x_2.jar)<br>
     • Unified management: Copies to all-in-one/ directory and creates project-level library<br>
-    • Version compatibility: Supports IntelliJ IDEA 2024.1–2025.1+ (build 241–251.*)<br><br>
+    • Declared IDE compatibility: IntelliJ IDEA builds 223–262.* (including IU-262.10315.125)<br><br>
     
     <strong>中文说明：</strong><br>
     一键收集项目中所有jar包依赖的工具插件。遍历项目目录收集所有jar文件，复制到all-in-one文件夹，并自动添加为项目库。<br><br>
