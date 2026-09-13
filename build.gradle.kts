@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "org.le1a"
-version = providers.gradleProperty("pluginVersion").orElse("1.5").get()
+version = providers.gradleProperty("pluginVersion").orElse("1.5.1").get()
 
 repositories {
     mavenCentral()
@@ -37,7 +37,10 @@ tasks {
             languageVersion.set(JavaLanguageVersion.of(17))
         }
         systemProperty("test.javac", fixtureCompiler.get().executablePath.asFile.absolutePath)
+        systemProperty("benchmark.exports", providers.gradleProperty("benchmarkExports").orElse("false").get())
+        maxHeapSize = "1g"
         testLogging {
+            showStandardStreams = providers.gradleProperty("benchmarkExports").orElse("false").get().toBoolean()
             events("passed", "failed", "skipped")
             exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
         }

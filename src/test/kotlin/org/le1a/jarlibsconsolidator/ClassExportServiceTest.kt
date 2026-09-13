@@ -178,4 +178,46 @@ class ClassExportServiceTest {
         assertEquals("original", Files.readString(target))
         Files.list(project).use { files -> assertFalse(files.anyMatch { it.fileName.toString().startsWith(".jarlibs-export-") }) }
     }
+
+    @Test fun `parallel cancellation preserves destination and joins decompiler workers`() {
+        val project = temporary.newFolder().toPath()
+        jar(project.resolve("a.jar"), compile("Outer", "package demo; public class Outer { public static class Inner {} }"))
+        val target = project.resolve("sources.zip")
+        Files.writeString(target, "original")
+        val started = java.util.concurrent.CountDownLatch(2)
+        val active = java.util.concurrent.atomic.AtomicInteger()
+        val cancel = java.util.concurrent.atomic.AtomicBoolean()
+        val decompiler = ClassDecompiler { _, _, checkCanceled ->
+            active.incrementAndGet(); started.countDown()
+            try {
+                check(started.await(5, TimeUnit.SECONDS))
+                cancel.set(true)
+                checkCanceled()
+                throw AssertionError("Cancellation was ignored")
+            } finally { active.decrementAndGet() }
+        }
+        assertThrows(CancellationException::class.java) {
+            ClassExportService.export(project, emptyList(), target, ExportFilter(), decompiler,
+                checkCanceled = { if (cancel.get()) throw CancellationException() }, parallelism = 2)
+        }
+        assertEquals(0, active.get())
+        assertEquals("original", Files.readString(target))
+        Files.list(project).use { files -> assertFalse(files.anyMatch { it.fileName.toString().startsWith(".jarlibs-export-") }) }
+    }
+
+    @Test fun `cached exports honor changed filters and replaced bytecode`() {
+        val project = temporary.newFolder().toPath()
+        val library = project.resolve("input.jar")
+        jar(library, compile("Same", "package demo; public class Same { public int value() { return 1; } }"))
+        val target = project.resolve("sources.zip")
+        val decompiler = IdeaJavaDecompiler(DecompilationCache())
+        ClassExportService.export(project, emptyList(), target, ExportFilter(), decompiler)
+        assertTrue("return 1;" in entries(target).getValue("demo/Same.java").toString(Charsets.UTF_8))
+        val filtered = ClassExportService.export(project, emptyList(), target, ExportFilter("", "Same"), decompiler)
+        assertEquals(0, filtered.exported)
+        assertFalse(entries(target).keys.any { it.endsWith(".java") })
+        jar(library, compile("Same", "package demo; public class Same { public int value() { return 2; } }"))
+        ClassExportService.export(project, emptyList(), target, ExportFilter(), decompiler)
+        assertTrue("return 2;" in entries(target).getValue("demo/Same.java").toString(Charsets.UTF_8))
+    }
 }

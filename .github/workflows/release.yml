@@ -73,6 +73,10 @@ jobs:
           path: build/distributions/*.zip
           if-no-files-found: error
 
+      - name: Compare decompiler export performance
+        if: github.event_name == 'pull_request'
+        run: ./gradlew --no-daemon test --tests '*ExportBenchmarkTest' -PbenchmarkExports=true
+
   release:
     if: github.event_name == 'workflow_dispatch'
     needs: build

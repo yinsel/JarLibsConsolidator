@@ -1,5 +1,7 @@
 package org.le1a.jarlibsconsolidator
 
+// Frozen pre-optimization implementation from 4abd2d1c2ead9afc75c2594d3f6bdca7bd014e10 for same-JVM benchmarks only.
+
 import org.jetbrains.java.decompiler.main.CancellationManager
 import org.jetbrains.java.decompiler.main.decompiler.BaseDecompiler
 import org.jetbrains.java.decompiler.main.extern.IBytecodeProvider
@@ -12,12 +14,9 @@ import java.nio.file.Path
 import java.util.jar.Manifest
 
 /** Uses the engine supplied by the installed IDEA Java Bytecode Decompiler plugin. */
-internal class IdeaJavaDecompiler(private val cache: DecompilationCache? = sessionCache) : ClassDecompiler {
+internal class LegacyIdeaJavaDecompiler : ClassDecompiler {
     override fun decompile(file: Path, internalName: String, checkCanceled: () -> Unit): DecompiledClass {
         checkCanceled()
-        val bytecode = Files.readAllBytes(file)
-        val key = cache?.key(internalName, bytecode)
-        if (key != null) cache?.get(key, bytecode)?.let { checkCanceled(); return it }
         var source: String? = null
         val warnings = mutableListOf<String>()
         val saver = object : IResultSaver {
@@ -52,7 +51,7 @@ internal class IdeaJavaDecompiler(private val cache: DecompilationCache? = sessi
             if (internalPath != null || Path.of(externalPath).toAbsolutePath().normalize() != file.toAbsolutePath().normalize()) {
                 throw IOException("不允许读取未选择的类：$externalPath")
             }
-            bytecode
+            Files.readAllBytes(file)
         }
         val options = mapOf<String, Any>(
             // Independent files preserve exact class filters, including blacklisted inner classes.
@@ -63,14 +62,10 @@ internal class IdeaJavaDecompiler(private val cache: DecompilationCache? = sessi
             IFernflowerPreferences.INDENT_STRING to "    "
         )
         val engine = BaseDecompiler(provider, saver, options, logger, cancellation)
-        try { engine.addSource(file.toFile()); engine.decompileContext() }
+        engine.addSource(file.toFile())
+        try { engine.decompileContext() }
         catch (e: CancellationManager.CanceledException) { throw (e.cause as? RuntimeException ?: e) }
-        finally { org.jetbrains.java.decompiler.main.DecompilerContext.setCurrentContext(null) }
         checkCanceled()
-        val result = DecompiledClass(source ?: throw IOException("IDEA 反编译器没有生成 $internalName 的源码：${warnings.joinToString()}"), warnings.toList())
-        if (key != null) cache?.put(key, bytecode, result)
-        return result
+        return DecompiledClass(source ?: throw IOException("IDEA 反编译器没有生成 $internalName 的源码：${warnings.joinToString()}"), warnings)
     }
-
-    companion object { private val sessionCache = DecompilationCache() }
 }
