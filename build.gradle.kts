@@ -31,6 +31,17 @@ dependencies {
     }
 }
 tasks {
+    test {
+        // These tests compile real bytecode; the IDE's bundled runtime may omit javac.
+        javaLauncher.set(javaToolchains.launcherFor {
+            languageVersion.set(JavaLanguageVersion.of(17))
+        })
+        testLogging {
+            events("passed", "failed", "skipped")
+            exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+        }
+    }
+
     // Set the JVM compatibility versions
     withType<JavaCompile> {
         sourceCompatibility = "17"
