@@ -212,6 +212,23 @@ class ClassFileCollectorTest {
         }
     }
 
+    @Test fun `copy failure retains both paths and original filesystem cause without overwriting`() {
+        val project = temporary.newFolder().toPath()
+        val source = Files.write(project.resolve("input.class"), byteArrayOf(1, 2, 3))
+        val output = project.resolve("all-in-one/classes")
+        val target = output.resolve("demo/Existing.class")
+        Files.createDirectories(target.parent)
+        Files.write(target, byteArrayOf(9))
+        val entry = ClassFileCollector.ClassFile(source, Path.of("demo/Existing.class"), project, project)
+        val error = assertThrows(java.io.IOException::class.java) {
+            ClassFileCollector.copy(listOf(entry), output)
+        }
+        assertTrue(error.message!!.contains(source.toString()))
+        assertTrue(error.message!!.contains(target.toString()))
+        assertTrue(error.cause is java.nio.file.FileAlreadyExistsException)
+        assertArrayEquals(byteArrayOf(9), Files.readAllBytes(target))
+    }
+
     @Test fun `cancellation propagates from scanning and copying`() {
         val project = temporary.newFolder().toPath()
         compile(project, "classes", "Example", "public class Example {}")

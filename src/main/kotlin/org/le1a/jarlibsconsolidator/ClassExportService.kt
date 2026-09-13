@@ -9,7 +9,6 @@ import java.nio.file.Path
 import java.nio.file.SimpleFileVisitor
 import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.BasicFileAttributes
-import java.util.concurrent.CancellationException
 import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
@@ -53,10 +52,14 @@ internal object ClassExportService {
         fun sourceLabel(path: Path): String = if (path.startsWith(base)) base.relativize(path).toString().replace('\\', '/')
             else "external/" + path.toList().takeLast(4).joinToString("/")
 
+        var loggedFailures = 0
         fun failure(origin: String, e: Exception) {
             checkCanceled()
-            if (e is CancellationException) throw e
-            failures.add("$origin: ${e.message ?: e.javaClass.simpleName}")
+            PluginDiagnostics.rethrowCancellation(e)
+            failures.add("$origin: ${PluginDiagnostics.describe(e)}")
+            // Bound default stack logging on damaged archives; DEBUG retains every failure.
+            if (loggedFailures++ < 20) PluginDiagnostics.warn("Export item failed: origin=$origin, target=$destination", e)
+            else PluginDiagnostics.debug("Export item failed: origin=$origin, target=$destination", e)
         }
 
         fun collect(origin: String, group: String, open: () -> InputStream) {
@@ -148,6 +151,7 @@ internal object ClassExportService {
         }
 
         try {
+            PluginDiagnostics.debug { "Export staging: work=$work, target=$destination, parallelism=${if (decompiler == null) 0 else parallelism}" }
             for (library in libraries.map { it.toAbsolutePath().normalize() }.distinct().sorted()) {
                 checkCanceled()
                 if (Files.isSymbolicLink(library)) continue
@@ -157,6 +161,7 @@ internal object ClassExportService {
             }
             checkCanceled()
             progress("依赖库扫描完成：$discovered 个 class，过滤 $filtered 个，待导出 ${items.size} 个", 0.3)
+            PluginDiagnostics.info("Export scan complete: discovered=$discovered, filtered=$filtered, duplicates=$duplicates, selected=${items.size}")
             archive = Files.createTempFile(destination.parent, ".jarlibs-export-", ".zip")
             val report = mutableListOf("zip_entry\tsource")
             val usedEntries = mutableSetOf<String>()
@@ -182,6 +187,7 @@ internal object ClassExportService {
                             }?.source
                         } catch (e: Exception) { failure(item.origin, e); continue }
                         checkCanceled()
+                        PluginDiagnostics.debug { "Write ZIP entry: origin=${item.origin}, entry=$entryName, target=$destination" }
                         check(usedEntries.add(entryName)) { "重复的 ZIP 条目：$entryName" }
                         // ZIP write errors abort the archive, rather than leaving a corrupt partial entry.
                         zip.putNextEntry(ZipEntry(entryName))
@@ -211,6 +217,7 @@ internal object ClassExportService {
             catch (_: AtomicMoveNotSupportedException) { Files.move(archive, destination, StandardCopyOption.REPLACE_EXISTING) }
             archive = null
             progress("导出完成", 1.0)
+            if (failures.isNotEmpty()) PluginDiagnostics.warn("Export completed with ${failures.size} failures/warnings: target=$destination; see export-report.txt; first 20 exception stacks at WARN, remaining at DEBUG")
             return Result(discovered, filtered, duplicates, exported, failures)
         } finally {
             archive?.let { Files.deleteIfExists(it) }

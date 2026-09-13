@@ -48,6 +48,8 @@ class AddJarDependenciesAction : AnAction() {
 
         val allInOneDir = File(basePath, "all-in-one")
 
+        PluginDiagnostics.info("Add dependencies requested: project=$basePath, target=$allInOneDir, IDE=${ApplicationInfo.getInstance().build}")
+
         // 检查all-in-one文件夹是否已存在
         if (allInOneDir.exists()) {
             val result = Messages.showYesNoDialog(
@@ -71,13 +73,15 @@ class AddJarDependenciesAction : AnAction() {
                     throw RuntimeException("部分文件无法删除，请检查文件权限或占用情况")
                 }
             } catch (e: Exception) {
-                showError(project, "无法删除现有文件夹: ${e.message}")
+                reportFailure(project, "无法删除现有文件夹: $allInOneDir", e)
                 return
             }
         }
 
         ProgressManager.getInstance().run(object : Task.Backgroundable(project, "正在收集 JAR 和 class 依赖...", true) {
             override fun run(indicator: ProgressIndicator) {
+                var phase = "扫描依赖"
+                val started = System.nanoTime()
                 try {
                     indicator.text = "正在扫描 JAR 和 class 文件..."
                     indicator.fraction = 0.1
@@ -86,12 +90,15 @@ class AddJarDependenciesAction : AnAction() {
                     val jarFiles = findJarFiles(File(basePath), indicator)
                     val classScan = ClassFileCollector.scan(Path.of(basePath)) { indicator.checkCanceled() }
 
+                    PluginDiagnostics.info("Dependency scan complete: jars=${jarFiles.size}, classes=${classScan.classes.size}, skipped=${classScan.skipped.size}")
+
                     if (jarFiles.isEmpty() && classScan.classes.isEmpty()) {
                         showInfo(project, "未找到可添加的 JAR 或 class 文件" +
                                 if (classScan.skipped.isEmpty()) "" else "\n跳过 ${classScan.skipped.size} 个无法读取的文件或目录")
                         return
                     }
 
+                    phase = "创建输出目录"
                     indicator.text = "正在创建all-in-one目录..."
                     indicator.fraction = 0.3
 
@@ -103,6 +110,7 @@ class AddJarDependenciesAction : AnAction() {
                     indicator.text = "正在复制 JAR 和 class 文件..."
                     indicator.fraction = 0.5
 
+                    phase = "复制 JAR 和 class"
                     // 复制文件
                     copyJarFiles(jarFiles, allInOneDir, indicator)
                     val classRoots = ClassFileCollector.copy(classScan.classes, allInOneDir.toPath().resolve("classes")) {
@@ -113,7 +121,11 @@ class AddJarDependenciesAction : AnAction() {
                     indicator.text = "正在添加到项目库..."
                     indicator.fraction = 0.8
 
-                    val onSuccess = { showSuccess(project, jarFiles.size, classScan.classes.size, classScan.skipped.size) }
+                    phase = "注册依赖库"
+                    val onSuccess = {
+                        PluginDiagnostics.info("Add dependencies complete: target=$allInOneDir, roots=${classRoots.size}, elapsedMs=${(System.nanoTime() - started) / 1_000_000}")
+                        showSuccess(project, jarFiles.size, classScan.classes.size, classScan.skipped.size)
+                    }
                     // 只有库和模块依赖提交完成后才显示成功。
                     if (isNewThreadingModel) {
                         addDirectoryToLibrary_New(project, allInOneDir, classRoots, onSuccess)
@@ -126,7 +138,7 @@ class AddJarDependenciesAction : AnAction() {
                 } catch (e: ProcessCanceledException) {
                     throw e
                 } catch (e: Exception) {
-                    showError(project, "操作失败：${e.message}")
+                    reportFailure(project, "操作失败：阶段=$phase，项目=$basePath，目标=$allInOneDir", e)
                 }
             }
         })
@@ -142,7 +154,8 @@ class AddJarDependenciesAction : AnAction() {
             indicator.checkCanceled()
 
             try {
-                dir.listFiles()?.forEach { file ->
+                val children = dir.listFiles() ?: throw java.io.IOException("无法列出目录: $dir")
+                children.forEach { file ->
                     indicator.checkCanceled()
 
                     when {
@@ -161,7 +174,8 @@ class AddJarDependenciesAction : AnAction() {
             } catch (e: ProcessCanceledException) {
                 throw e
             } catch (e: Exception) {
-                // 忽略无法访问的目录
+                PluginDiagnostics.rethrowCancellation(e)
+                PluginDiagnostics.warn("JAR scan skipped directory: $dir", e)
             }
         }
 
@@ -191,6 +205,7 @@ class AddJarDependenciesAction : AnAction() {
         jarFiles.forEachIndexed { index, jarFile ->
             indicator.checkCanceled()
 
+            var targetFile = File(targetDir, jarFile.name)
             try {
                 // 处理重名文件
                 var targetName = jarFile.name
@@ -205,7 +220,8 @@ class AddJarDependenciesAction : AnAction() {
                     nameCount[targetName] = 1
                 }
 
-                val targetFile = File(targetDir, targetName)
+                targetFile = File(targetDir, targetName)
+                PluginDiagnostics.debug { "Copy JAR: source=$jarFile, target=$targetFile" }
                 Files.copy(jarFile.toPath(), targetFile.toPath(), StandardCopyOption.REPLACE_EXISTING)
 
                 val progress = 0.5 + (index + 1).toDouble() / jarFiles.size * 0.3
@@ -213,7 +229,8 @@ class AddJarDependenciesAction : AnAction() {
                 indicator.text2 = "复制: ${jarFile.name} (${index + 1}/${jarFiles.size})"
 
             } catch (e: Exception) {
-                throw RuntimeException("复制文件失败: ${jarFile.name} -> ${e.message}")
+                PluginDiagnostics.rethrowCancellation(e)
+                throw java.io.IOException("复制 JAR 失败: source=$jarFile, target=$targetFile", e)
             }
         }
     }
@@ -231,9 +248,7 @@ class AddJarDependenciesAction : AnAction() {
                 }
                 onSuccess()
             } catch (e: Exception) {
-                ApplicationManager.getApplication().invokeLater {
-                    Messages.showErrorDialog(project, "添加到项目库失败：${e.message}", "错误")
-                }
+                reportFailure(project, "添加到项目库失败：target=$allInOneDir", e)
             }
         }
     }
@@ -249,7 +264,8 @@ class AddJarDependenciesAction : AnAction() {
                 try {
                     performLibraryOperations(project, allInOneDir, classRoots)
                 } catch (e: Exception) {
-                    throw RuntimeException("添加到项目库失败：${e.message}")
+                    PluginDiagnostics.rethrowCancellation(e)
+                    throw RuntimeException("添加到项目库失败：target=$allInOneDir", e)
                 }
             }
             onSuccess()
@@ -260,6 +276,7 @@ class AddJarDependenciesAction : AnAction() {
      * 核心库操作逻辑，两个版本共用
      */
     private fun performLibraryOperations(project: Project, allInOneDir: File, classRoots: List<Path>) {
+        PluginDiagnostics.info("Register library: target=$allInOneDir, classRoots=${classRoots.size}")
         // 刷新文件系统
         LocalFileSystem.getInstance().refresh(false)
         val allInOneVirtualDir = LocalFileSystem.getInstance().refreshAndFindFileByIoFile(allInOneDir)
@@ -295,18 +312,22 @@ class AddJarDependenciesAction : AnAction() {
             jarChildren.forEach { vf ->
                 try {
                     val jarRoot = JarFileSystem.getInstance().refreshAndFindFileByPath("${vf.path}!/")
+                    if (jarRoot == null) PluginDiagnostics.warn("Cannot resolve JAR library root: ${vf.path}")
                     jarRoot?.let {
+                        PluginDiagnostics.debug { "Register JAR root: ${it.url}" }
                         libraryModel.addRoot(it, OrderRootType.CLASSES)
                     }
                 } catch (e: Exception) {
                     // 记录但不中断，继续处理其他jar文件
-                    println("警告：无法添加jar文件 ${vf.name}: ${e.message}")
+                    PluginDiagnostics.rethrowCancellation(e)
+                    PluginDiagnostics.warn("Cannot register JAR library root: ${vf.path}", e)
                 }
             }
 
             classRoots.forEach { path ->
                 val root = LocalFileSystem.getInstance().refreshAndFindFileByIoFile(path.toFile())
                     ?: throw RuntimeException("无法找到 class 库根目录: $path")
+                PluginDiagnostics.debug { "Register class root: $path" }
                 libraryModel.addRoot(root, OrderRootType.CLASSES)
             }
 
@@ -335,7 +356,8 @@ class AddJarDependenciesAction : AnAction() {
                 moduleModel.commit()
             } catch (e: Exception) {
                 moduleModel.dispose()
-                // 继续执行，不中断整个流程
+                PluginDiagnostics.rethrowCancellation(e)
+                PluginDiagnostics.warn("Cannot remove library $libraryName from module ${module.name}", e)
             }
         }
     }
@@ -358,25 +380,33 @@ class AddJarDependenciesAction : AnAction() {
                 moduleModel.commit()
             } catch (e: Exception) {
                 moduleModel.dispose()
-                throw RuntimeException("无法将库添加到模块 ${module.name}: ${e.message}")
+                PluginDiagnostics.rethrowCancellation(e)
+                throw RuntimeException("无法将库添加到模块 ${module.name}", e)
             }
         }
     }
 
+    private fun reportFailure(project: Project, context: String, error: Exception) {
+        PluginDiagnostics.rethrowCancellation(error)
+        PluginDiagnostics.warn(context, error)
+        showError(project, PluginDiagnostics.userMessage(context, error))
+    }
+
     private fun showInfo(project: Project, message: String) {
         ApplicationManager.getApplication().invokeLater {
-            Messages.showInfoMessage(project, message, "提示")
+            if (!project.isDisposed) Messages.showInfoMessage(project, message, "提示")
         }
     }
 
     private fun showError(project: Project, message: String) {
         ApplicationManager.getApplication().invokeLater {
-            Messages.showErrorDialog(project, message, "错误")
+            if (!project.isDisposed) Messages.showErrorDialog(project, message, "错误")
         }
     }
 
     private fun showSuccess(project: Project, jarCount: Int, classCount: Int, skippedCount: Int) {
         ApplicationManager.getApplication().invokeLater {
+            if (project.isDisposed) return@invokeLater
             val versionInfo = if (isNewThreadingModel) "2025.1+" else "2024.3-"
             Messages.showInfoMessage(
                 project,

@@ -163,7 +163,22 @@ class ClassExportServiceTest {
         val result = ClassExportService.export(project, listOf(project), target, ExportFilter(), decompiler)
         assertEquals(1, result.exported)
         assertEquals(2, result.failures.size)
+        assertTrue(result.failures.any { it.contains("java.io.IOException: test decompilation failure") })
         assertTrue(entries(target).getValue("export-report.txt").toString(Charsets.UTF_8).contains("test decompilation failure"))
+    }
+
+    @Test fun `wrapped IDEA cancellation aborts export and preserves destination`() {
+        val project = temporary.newFolder().toPath()
+        val dependency = jar(project.resolve("dependency.jar"), compile("Example", "public class Example {}"))
+        val target = Files.writeString(project.resolve("export.zip"), "existing destination")
+        val canceled = com.intellij.openapi.progress.ProcessCanceledException()
+        val decompiler = ClassDecompiler { _, _, _ -> throw IOException("engine wrapper", canceled) }
+        val error = assertThrows(com.intellij.openapi.progress.ProcessCanceledException::class.java) {
+            ClassExportService.export(project, listOf(dependency), target, ExportFilter(), decompiler)
+        }
+        assertSame(canceled, error)
+        assertEquals("existing destination", Files.readString(target))
+        Files.list(project).use { paths -> assertFalse(paths.anyMatch { it.fileName.toString().startsWith(".jarlibs-export-") }) }
     }
 
     @Test fun `cancellation preserves existing destination and cleans partial zip`() {

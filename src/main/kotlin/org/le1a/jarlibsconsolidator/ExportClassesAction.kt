@@ -49,10 +49,15 @@ internal abstract class BaseExportAction(private val javaSources: Boolean) : AnA
         val selected = saver.save(initial, defaultName)?.file ?: return
         val target = (if (selected.name.endsWith(".zip", true)) selected else java.io.File(selected.parentFile, selected.name + ".zip")).toPath()
         if (Files.exists(target) && Messages.showYesNoDialog(project, "文件已存在，是否替换？\n$target", "确认覆盖", Messages.getQuestionIcon()) != Messages.YES) return
-        val filter = ExportFilter(options.whitelist.text, options.blacklist.text)
+        val whitelist = options.whitelist.text
+        val blacklist = options.blacklist.text
+        val filter = ExportFilter(whitelist, blacklist)
         ProgressManager.getInstance().run(object : Task.Backgroundable(project, if (javaSources) "反编译并导出 JAVA" else "导出 CLASS", true) {
             override fun run(indicator: ProgressIndicator) {
+                val started = System.nanoTime()
                 try {
+                    PluginDiagnostics.info("Export requested: mode=${if (javaSources) "JAVA" else "CLASS"}, project=$base, target=$target")
+                    PluginDiagnostics.debug { "Export filters: whitelist=$whitelist, blacklist=$blacklist" }
                     indicator.isIndeterminate = true
                     indicator.text = "正在读取 IDEA 已登记的依赖库…"
                     val libraries = ReadAction.compute<List<Path>, RuntimeException> {
@@ -69,6 +74,7 @@ internal abstract class BaseExportAction(private val javaSources: Boolean) : AnA
                             local?.takeIf { it.fileSystem.protocol == "file" }?.let { Path.of(it.path) }
                         }.distinct()
                     }
+                    PluginDiagnostics.debug { "Export registered libraries: ${libraries.joinToString()}" }
                     val result = ClassExportService.export(base, libraries, target, filter, decompiler(),
                         checkCanceled = { indicator.checkCanceled() },
                         progress = { text, fraction ->
@@ -76,6 +82,7 @@ internal abstract class BaseExportAction(private val javaSources: Boolean) : AnA
                             indicator.text = text
                             if (fraction >= 0.3) indicator.fraction = fraction
                         })
+                    PluginDiagnostics.info("Export complete: target=$target, discovered=${result.discovered}, filtered=${result.filtered}, duplicates=${result.duplicates}, exported=${result.exported}, failures=${result.failures.size}, elapsedMs=${(System.nanoTime() - started) / 1_000_000}")
                     ApplicationManager.getApplication().invokeLater {
                         if (!project.isDisposed) {
                             val message = "已导出 ${result.exported} 个文件\n扫描 ${result.discovered} 个 class，过滤 ${result.filtered} 个，相同内容去重 ${result.duplicates} 个\n" +
@@ -86,8 +93,10 @@ internal abstract class BaseExportAction(private val javaSources: Boolean) : AnA
                     }
                 } catch (e: ProcessCanceledException) { throw e }
                 catch (e: Exception) {
+                    PluginDiagnostics.rethrowCancellation(e)
+                    PluginDiagnostics.warn("Export failed: project=$base, target=$target, javaSources=$javaSources", e)
                     ApplicationManager.getApplication().invokeLater {
-                        if (!project.isDisposed) Messages.showErrorDialog(project, e.message ?: e.javaClass.simpleName, "导出失败")
+                        if (!project.isDisposed) Messages.showErrorDialog(project, PluginDiagnostics.userMessage("导出失败：$target", e), "导出失败")
                     }
                 }
             }

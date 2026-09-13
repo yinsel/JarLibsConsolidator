@@ -42,7 +42,8 @@ internal object ClassFileCollector {
                         }
                         if (!sourceRoot.startsWith(base)) sourceRoot = file.parent
                         classes.add(ClassFile(file, relative, sourceRoot, base))
-                    } catch (_: IOException) {
+                    } catch (error: IOException) {
+                        PluginDiagnostics.debug("Skipped class: $file", error)
                         skipped.add(file)
                     }
                 }
@@ -51,10 +52,12 @@ internal object ClassFileCollector {
 
             override fun visitFileFailed(file: Path, exc: IOException): FileVisitResult {
                 checkCanceled()
+                PluginDiagnostics.debug("Cannot visit class scan path: $file", exc)
                 skipped.add(file)
                 return FileVisitResult.CONTINUE
             }
         })
+        if (skipped.isNotEmpty()) PluginDiagnostics.warn("Class scan skipped ${skipped.size} files/directories under $base; enable DEBUG for paths and exceptions")
         return ScanResult(classes.sortedBy { it.source.toString() }, skipped)
     }
 
@@ -104,7 +107,9 @@ internal object ClassFileCollector {
                 checkCanceled()
                 val identical = versions.any {
                     checkCanceled()
-                    Files.mismatch(it.source, entry.source) == -1L
+                    PluginDiagnostics.io({ "比较 class 失败: first=${it.source}, second=${entry.source}" }) {
+                        Files.mismatch(it.source, entry.source) == -1L
+                    }
                 }
                 if (!identical) versions.add(entry)
             }
@@ -112,8 +117,11 @@ internal object ClassFileCollector {
                 checkCanceled()
                 val root = if (versions.size == 1) output else conflictRoot(entry)
                 val target = root.resolve(entry.relativePath)
-                Files.createDirectories(target.parent)
-                Files.copy(entry.source, target)
+                PluginDiagnostics.debug { "Copy class: name=${entry.relativePath}, source=${entry.source}, target=$target, versions=${versions.size}" }
+                PluginDiagnostics.io({ "复制 class 失败: source=${entry.source}, target=$target" }) {
+                    Files.createDirectories(target.parent)
+                    Files.copy(entry.source, target)
+                }
                 roots.add(root)
                 if (versions.size > 1) {
                     conflictSources.add(listOf(root.fileName.toString(), entry.relativePath.toString(),
