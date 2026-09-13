@@ -33,7 +33,7 @@ dependencies {
 tasks {
     test {
         // These tests compile real bytecode; the IDE's bundled runtime may omit javac.
-        javaLauncher.set(javaToolchains.launcherFor {
+        javaLauncher.set(project.extensions.getByType<org.gradle.jvm.toolchain.JavaToolchainService>().launcherFor {
             languageVersion.set(JavaLanguageVersion.of(17))
         })
         testLogging {
