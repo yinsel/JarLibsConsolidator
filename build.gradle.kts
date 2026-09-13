@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "org.le1a"
-version = "1.1"
+version = providers.gradleProperty("pluginVersion").orElse("1.2").get()
 
 repositories {
     mavenCentral()
@@ -40,7 +40,7 @@ tasks {
 
     patchPluginXml {
         sinceBuild.set("223")
-        untilBuild.set("253.*")
+        untilBuild.set("262.*")
     }
 
     signPlugin {

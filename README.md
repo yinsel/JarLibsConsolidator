@@ -2,7 +2,7 @@
 
 一键收集并合并项目中的 JAR 依赖，统一输出到 `all-in-one` 目录，并自动添加为项目库，挂载到所有模块。
 
-![Kotlin](https://img.shields.io/badge/Kotlin-1.9.25-7F52FF?logo=kotlin) ![Gradle](https://img.shields.io/badge/Gradle-8.x-02303A?logo=gradle) ![IntelliJ%20Platform](https://img.shields.io/badge/IntelliJ%20Platform-241--251.*-000?logo=intellijidea) ![JDK](https://img.shields.io/badge/JDK-17-5382A1)
+![Kotlin](https://img.shields.io/badge/Kotlin-1.9.25-7F52FF?logo=kotlin) ![Gradle](https://img.shields.io/badge/Gradle-8.x-02303A?logo=gradle) ![IntelliJ%20Platform](https://img.shields.io/badge/IntelliJ%20Platform-223--262.*-000?logo=intellijidea) ![JDK](https://img.shields.io/badge/JDK-17-5382A1)
 
 ### 📺 演示视频
 
@@ -31,24 +31,11 @@ cp `find ./ -name "*.jar"` ./all-in-one
 - **智能扫描**：递归扫描 `.jar`，跳过常见目录（如 `node_modules`、`target`、`build`、`.gradle`、`.mvn` 等）。
 - **重名处理**：自动对同名 jar 加后缀去重（如 `x.jar` → `x_2.jar`）。
 - **统一管理**：复制到 `all-in-one/`，创建项目级库 `all-in-one` 并添加至所有模块依赖。
-- **版本兼容**：适配 2024.1–2025.1+（build `241`–`251.*`）线程模型与 API。
+- **版本范围**：插件声明支持 build `223`–`262.*`，包含 `IU-262.10315.125`。
 
 ### 前置依赖
 
-由于 Gradle 分发包体积较大（130MB+），需要手动下载并放置到项目根目录：
-
-```bash
-# 下载 Gradle 8.11.1 分发包
-wget https://mirrors.cloud.tencent.com/gradle/gradle-8.11.1-bin.zip
-
-# 或者使用 curl
-curl -O https://mirrors.cloud.tencent.com/gradle/gradle-8.11.1-bin.zip
-
-# 确保文件位于项目根目录
-ls gradle-8.11.1-bin.zip
-```
-
-**注意**：该文件已被 `.gitignore` 排除，不会被提交到版本控制中。
+安装 JDK 17。首次运行 `./gradlew` 时会自动下载 Gradle 8.11.1 并校验 SHA-256，无需手动放置分发包；构建时需能访问 Gradle、Maven 和 JetBrains 下载服务。
 
 ### 快速上手
 1) **插件已上传至JetBrains Marketplace，可直接在IDEA插件市场搜索JarLibsConsolidator进行安装**
@@ -66,7 +53,26 @@ ls gradle-8.11.1-bin.zip
 # 产物：build/distributions/JarLibsConsolidator-<version>.zip
 # IDE 中安装：Settings/Preferences → Plugins → ⚙ → Install Plugin from Disk…
 ```
-或者直接用Releases里我打包好的jar包，在IDEA插件选择本地磁盘安装即可。
+也可以下载本仓库 Releases 中的 `JarLibsConsolidator-<version>.zip`，在 IDEA 中选择从磁盘安装，无需解压。
+
+### 手动构建并发布 GitHub Release
+
+1. 将工作流合并到默认分支 `main`。如果 fork 仓库的 Actions 未启用，先在 **Actions** 页面启用。
+2. 打开 **Actions → Build and Release → Run workflow**，选择要发布的分支。
+3. 在 `tag` 输入新版本号，例如 `v1.2` 或 `v1.2.3`，再点击 **Run workflow**。
+4. 工作流会执行检查和构建，成功后为本次运行的提交创建标签、发布 Release，并上传可安装的插件 ZIP。
+
+标签去掉 `v` 后会作为插件版本和 ZIP 文件名中的版本，例如 `v1.2` 对应 `JarLibsConsolidator-1.2.zip`。已有标签会被拒绝，不会覆盖既有版本。如果创建标签后 Release 发布失败，需先检查并处理残留标签，再重新运行。
+
+工作流使用仓库自带的 `GITHUB_TOKEN`，仅发布步骤拥有 `contents: write` 权限，无需配置个人令牌或 Marketplace 密钥。PR 和 `main` 分支推送只执行构建检查并保存 Actions artifact，只有手动运行才发布 Release。
+
+本地指定同样的版本：
+
+```bash
+./gradlew clean check buildPlugin verifyPluginStructure -PpluginVersion=1.2
+```
+
+若旧版 `1.1` 提示仅支持 `253.*`，请从新的 Release 下载并安装 ZIP；修改仓库配置不会改变已经安装的旧包。
 
 ### 使用
 - 在 Project 视图中右键项目根目录或任意目录 → 选择“**一键添加依赖**”。
@@ -79,8 +85,9 @@ ls gradle-8.11.1-bin.zip
 3. 创建/刷新项目库 `all-in-one`，将 jar 作为 `CLASSES` 根添加，并依附到所有模块。
 
 ### 兼容性与要求
-- **IDE**：IntelliJ IDEA 2024.1 – 2025.1+（build `241`–`251.*`）
-- **JDK**：17
+- **IDE 声明范围**：build `223`–`262.*`（包含 `IU-262.10315.125`），保留原最低版本 `223`。
+- **编译基线**：IntelliJ IDEA Ultimate 2024.1.6；扩大版本范围解决安装时的版本上限拦截，不代表已经在所有 IDE 版本上完成运行验证。
+- **构建 JDK / 字节码目标**：17；运行 IDEA 使用其自带的 JetBrains Runtime。
 - **运行时插件**：`com.intellij.java`（已通过平台打包）
 
 ### 常见问答
@@ -98,4 +105,3 @@ ls gradle-8.11.1-bin.zip
 # 构建可分发包
 ./gradlew buildPlugin
 ```
-

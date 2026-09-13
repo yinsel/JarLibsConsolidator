@@ -1,0 +1,105 @@
+name: Build and Release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.2 or v1.2.3)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate release tag
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*))?$ ]]; then
+            echo '::error::Tag must use vx.x or vx.x.x format (e.g. v1.2 or v1.2.3).'
+            exit 1
+          fi
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            echo "::error::Tag $RELEASE_TAG already exists. Choose a new version."
+            exit 1
+          fi
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build and check plugin
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=()
+          if [[ -n "$RELEASE_TAG" ]]; then
+            args+=("-PpluginVersion=${RELEASE_TAG#v}")
+          fi
+          ./gradlew --no-daemon clean check buildPlugin verifyPluginStructure "${args[@]}"
+
+      - name: Upload installable plugin ZIP
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-${{ github.sha }}
+          path: build/distributions/*.zip
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download plugin ZIP
+        uses: actions/download-artifact@v4
+        with:
+          name: plugin-${{ github.sha }}
+          path: dist
+
+      - name: Create tag and publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          SOURCE_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Creating the ref fails if the tag already exists; never move an existing tag.
+          gh api --method POST "repos/$GH_REPO/git/refs" \
+            -f "ref=refs/tags/$RELEASE_TAG" -f "sha=$SOURCE_SHA"
+          gh release create "$RELEASE_TAG" dist/*.zip \
+            --verify-tag \
+            --title "JarLibsConsolidator $RELEASE_TAG" \
+            --generate-notes
