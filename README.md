@@ -156,3 +156,18 @@ JAVA 导出使用有限并行：根据 CPU 数量保留一个逻辑核心，最�
 # 构建可分发包
 ./gradlew buildPlugin
 ```
+
+
+### 异常日志与 DEBUG 排查
+
+从 1.5.3 起，操作失败弹窗会显示失败阶段、异常类型及原因链；复制失败还会包含源文件与目标文件路径。原始异常堆栈写入 IDEA 的 `idea.log`，无需开启 DEBUG。日志中的操作开始、扫描完成和成功结束记录可用于判断卡在哪个阶段及总耗时。
+
+1. 打开 **Help → Show Log in Explorer**（macOS 为 Show Log in Finder），查看 `idea.log`。
+2. 如需逐文件诊断，打开 **Help → Diagnostic Tools → Debug Log Settings**，添加一行：
+   ```text
+   #org.le1a.jarlibsconsolidator
+   ```
+3. 重新执行出错操作，搜索 `org.le1a.jarlibsconsolidator`、`复制 class 失败` 或 `Export failed`，提供该时间附近包含 `Caused by` 的完整堆栈。
+4. 排查结束后删除该 DEBUG 配置，避免大量文件映射日志影响速度和占用磁盘。
+
+DEBUG 记录扫描跳过的路径/异常、源文件到目标路径的映射、库根、导出过滤条件与 ZIP 条目，不记录字节码或反编译源码内容。分享日志前可遮盖敏感路径。导出单项失败的异常类型仍全部保存在 ZIP 内 `export-report.txt`；为限制损坏归档产生的大量日志，每次导出默认只记录前 20 个单项失败的完整堆栈，其余堆栈在 DEBUG 下记录。取消操作不会当作失败报错。
