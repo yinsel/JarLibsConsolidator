@@ -5,7 +5,24 @@ plugins {
 }
 
 group = "org.le1a"
-version = providers.gradleProperty("pluginVersion").orElse("1.5.8").get()
+// Release builds override this with the workflow's tag. Local/branch builds derive
+// a version from Git, so a new release never needs a source-version edit.
+val gitVersion = providers.exec {
+    commandLine("git", "describe", "--tags", "--long", "--always", "--dirty", "--abbrev=12", "--match", "v[0-9]*")
+}.standardOutput.asText.map { output ->
+    val description = output.trim()
+    val tagged = Regex("^v([0-9]+(?:\\.[0-9]+){1,2})-([0-9]+)-g([0-9a-f]+)(-dirty)?$").matchEntire(description)
+    if (tagged != null) {
+        val (release, distance, commit, dirty) = tagged.destructured
+        if (distance == "0" && dirty.isEmpty()) release
+        else "$release-dev.$distance.$commit" + if (dirty.isEmpty()) "" else ".dirty"
+    } else {
+        val untagged = Regex("^([0-9a-f]+)(-dirty)?$").matchEntire(description)
+            ?: throw GradleException("Cannot derive plugin version from Git: $description. Use -PpluginVersion=<version>.")
+        "0.0.0-dev.${untagged.groupValues[1]}" + if (untagged.groupValues[2].isEmpty()) "" else ".dirty"
+    }
+}
+version = providers.gradleProperty("pluginVersion").orElse(gitVersion).get()
 
 repositories {
     mavenCentral()

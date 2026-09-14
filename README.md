@@ -67,6 +67,8 @@ cp `find ./ -name "*.jar"` ./all-in-one
 
 标签去掉 `v` 后会作为插件版本和 ZIP 文件名中的版本，例如 `v1.2` 对应 `JarLibsConsolidator-1.2.zip`。已有标签会被拒绝，不会覆盖既有版本。如果创建标签后 Release 发布失败，需先检查并处理残留标签，再重新运行。
 
+仓库不再固定插件版本号。版本优先使用 `-PpluginVersion`（手动 Release 会从输入 tag 自动传入）；否则从 Git 推导：干净的 tag 提交使用该 tag 的版本，未打 tag 的提交使用 `<最近tag版本>-dev.<提交距离>.<提交号>`，有未提交修改时附加 `.dirty`。没有历史 tag 时使用 `0.0.0-dev.<提交号>`。版本同时用于插件内的 `META-INF/plugin.xml` 和安装 ZIP 文件名，因此发布新 tag 不需要再修改源码版本。下载不含 Git 历史的源码 ZIP 后编译，需要显式传入 `-PpluginVersion=<版本>`。
+
 工作流使用仓库自带的 `GITHUB_TOKEN`，仅发布步骤拥有 `contents: write` 权限，无需配置个人令牌或 Marketplace 密钥。PR 和 `main` 分支推送只执行构建检查并保存 Actions artifact，只有手动运行才发布 Release。
 
 本地指定同样的版本：
