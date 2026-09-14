@@ -19,6 +19,9 @@ internal data class DecompiledClass(val source: String, val warnings: List<Strin
 internal fun interface ClassDecompiler {
     fun decompile(file: Path, internalName: String, checkCanceled: () -> Unit): DecompiledClass
     val mergeInnerClasses: Boolean get() = false
+    val requiresOriginalFiles: Boolean get() = false
+    fun registerSource(snapshot: Path, source: ClassSource) {}
+    fun releaseSources() {}
     fun decompileGroup(inputs: List<Pair<Path, String>>, checkCanceled: () -> Unit): DecompiledClass {
         require(inputs.size == 1)
         return decompile(inputs[0].first, inputs[0].second, checkCanceled)
@@ -77,7 +80,7 @@ internal object ClassExportService {
             return reason
         }
 
-        fun collect(origin: String, group: String, open: () -> InputStream) {
+        fun collect(origin: String, group: String, source: ClassSource, open: () -> InputStream) {
             checkCanceled()
             discovered++
             scanProgress.update { "扫描依赖库：已扫描 $discovered 个 class，已过滤 $filtered 个；$origin" }
@@ -86,14 +89,15 @@ internal object ClassExportService {
                 val accepted = ClassSnapshot.read(open(), staged, filter, checkCanceled)
                 if (accepted == null) { filtered++; return }
                 val (name, digest) = accepted
+                decompiler?.registerSource(staged, source)
                 val existing = versions.getOrPut(name) { mutableListOf() }
                 if (existing.any { it.digest == digest && Files.mismatch(it.file, staged) == -1L }) {
                     duplicates++
                     if (decompiler?.mergeInnerClasses == true) {
-                        val shared = existing.first { it.digest == digest && Files.mismatch(it.file, staged) == -1L }
-                        items.add(Item(name, shared.file, origin, group, digest))
+                        // Retain this origin's snapshot: identical outers can have different native siblings.
+                        items.add(Item(name, staged, origin, group, digest))
                     }
-                    Files.delete(staged)
+                    if (decompiler?.mergeInnerClasses != true) Files.delete(staged)
                 } else {
                     Item(name, staged, origin, group, digest).also { existing.add(it); items.add(it) }
                 }
@@ -108,7 +112,7 @@ internal object ClassExportService {
                         checkCanceled()
                         val entry = entries.nextElement()
                         if (!entry.isDirectory && entry.name.endsWith(".class", true)) {
-                            collect("$label!/${entry.name}", label) { zip.getInputStream(entry) }
+                            collect("$label!/${entry.name}", label, ClassSource(path, entry.name)) { zip.getInputStream(entry) }
                         } else if (!entry.isDirectory && entry.name.endsWith(".jar", true)) {
                             val origin = "$label!/${entry.name}"
                             if (depth >= 8) { failures.add("$origin: 嵌套 JAR 超过 8 层"); continue }
@@ -129,7 +133,7 @@ internal object ClassExportService {
                                 } }
                                 scanJar(nested, origin, depth + 1)
                             } catch (e: Exception) { failure(origin, e) }
-                            finally { Files.deleteIfExists(nested) }
+                            finally { if (decompiler?.requiresOriginalFiles != true) Files.deleteIfExists(nested) }
                         }
                     }
                 }
@@ -144,7 +148,7 @@ internal object ClassExportService {
             if ((!isClass && !isJar) || !seenFiles.add(path)) return
             if (!knownRegular && Files.isSymbolicLink(path)) return
             when {
-                isClass -> collect(sourceLabel(path), sourceLabel(path.parent)) { Files.newInputStream(path) }
+                isClass -> collect(sourceLabel(path), sourceLabel(path.parent), ClassSource(path)) { Files.newInputStream(path) }
                 isJar -> scanJar(path)
             }
         }
@@ -247,7 +251,7 @@ internal object ClassExportService {
                         unit.members.forEach { report.add("${tsv(entryName)}\t${tsv(it.origin)}") }
                     }
                     val summary = "扫描 class: $discovered\n已过滤: $filtered\n相同内容去重: $duplicates\n已导出文件: $exported\n失败/警告: ${failures.size}\n" +
-                            (if (decompiler == null) "" else "反编译失败: ${decompilationFailures.size}\n已保留部分源码文件: $partiallyExported（包含失败的方法，不代表完整成功）\n反编译引擎：IDEA 内置 Fernflower；同一来源且命中过滤的内部类合并导出，缺少选中的外部类时单独导出。\n") +
+                            (if (decompiler == null) "" else "反编译失败: ${decompilationFailures.size}\n已保留部分源码文件: $partiallyExported（包含失败的方法，不代表完整成功）\n反编译入口：IDEA 原生 Java Bytecode Decompiler；原生源码原样保留。若原生入口会读取未选中的内部类，则跳过该源码文件并记录 CSV。部分源码按输出文件记录，具体失败方法见 idea.log。\n") +
                             failures.joinToString("\n")
                     if (decompilationFailures.isNotEmpty()) {
                         zip.putNextEntry(ZipEntry("decompilation-failures.csv"))
@@ -277,6 +281,7 @@ internal object ClassExportService {
             if (failures.isNotEmpty()) PluginDiagnostics.warn("Export completed with ${failures.size} failures/warnings: target=$destination; see export-report.txt; first 20 exception stacks at WARN, remaining at DEBUG")
             return Result(discovered, filtered, duplicates, exported, failures, decompilationFailures.size, partiallyExported)
         } finally {
+            decompiler?.releaseSources()
             archive?.let { Files.deleteIfExists(it) }
             work.toFile().deleteRecursively()
         }

@@ -117,6 +117,7 @@ jobs:
         run: |
           set -euo pipefail
           branches=(
+            fix/native-idea-decompilation
             fix/parameter-increment-decompilation
             fix/ssa-decompiler-recovery
             feat/batched-decompiler

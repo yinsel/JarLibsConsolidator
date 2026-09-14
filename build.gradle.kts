@@ -39,7 +39,8 @@ dependencies {
     testImplementation("junit:junit:4.13.2")
     testImplementation(kotlin("stdlib"))
     intellijPlatform {
-        intellijIdeaUltimate("2024.1.6")
+        intellijIdeaUltimate(providers.gradleProperty("ideaVersion").orElse("2024.1.6"))
+        testFramework(org.jetbrains.intellij.platform.gradle.TestFrameworkType.Platform)
         bundledPlugins("com.intellij.java", "org.jetbrains.java.decompiler")
         
         pluginVerifier()
