@@ -14,7 +14,7 @@ import java.util.concurrent.atomic.AtomicInteger
 class BatchParallelDecompilerTest {
     private fun inputs(count: Int) = (0 until count).map { listOf(Path.of("unused") to "$it") }
 
-    @Test fun `forty item batches run concurrently and preserve ordered output despite item failures`() {
+    @Test fun `forty item batches run concurrently and preserve result identity despite item failures`() {
         val started = CountDownLatch(2)
         val threads = Collections.synchronizedMap(mutableMapOf<Int, String>())
         val decompiler = ClassDecompiler { _, name, _ ->
@@ -27,15 +27,23 @@ class BatchParallelDecompilerTest {
         }
         val sources = java.util.concurrent.ConcurrentHashMap<Int, String>()
         BatchParallelDecompiler(inputs(83), decompiler, 2, {}, writeSource = { i, text, _ -> sources[i] = text }).use { pipeline ->
-            for (i in 0 until 83) {
-                if (i == 13 || i == 41) assertEquals("broken-$i", assertThrows(IOException::class.java) { pipeline.next() }.message)
-                else {
-                    val result = pipeline.next()
+            val seen = mutableSetOf<Int>()
+            repeat(83) {
+                val completion = pipeline.next()
+                val i = completion.index
+                assertTrue("Duplicate completion $i", seen.add(i))
+                if (i == 13 || i == 41) {
+                    assertTrue(completion.error is IOException)
+                    assertEquals("broken-$i", completion.error!!.message)
+                } else {
+                    assertNull(completion.error)
+                    val result = completion.result!!
                     assertEquals("source-$i", sources[i])
                     assertEquals(if (i == 17) listOf("warning") else emptyList<String>(), result.warnings)
                     assertEquals(if (i == 18) listOf(DecompilationIssue("18", "IOException", "method failed")) else emptyList<DecompilationIssue>(), result.issues)
                 }
             }
+            assertEquals((0 until 83).toSet(), seen)
         }
         assertEquals(1, (0 until 40).map { threads[it] }.toSet().size)
         assertEquals(1, (40 until 80).map { threads[it] }.toSet().size)

@@ -31,33 +31,34 @@ class StreamingExportTest {
                 assertTrue(secondStarted.await(5, TimeUnit.SECONDS))
                 assertEquals("class C0 {}", Files.readString(output.root.resolve("C0.java")))
                 assertFalse(Files.exists(output.root.resolve("C1.java")))
-                assertTrue(pipeline.next().issues.isEmpty())
+                assertTrue(pipeline.next().result!!.issues.isEmpty())
             } finally { releaseSecond.countDown() }
             repeat(39) { pipeline.next() }
         }
         assertEquals(40L, Files.list(output.root).use { it.count() })
     }
 
-    @Test fun `later batch keeps writing all forty files while an earlier class is slow`() {
+    @Test fun `worker claims a third batch and reports progress while first batch is blocked`() {
         val firstStarted = CountDownLatch(1)
         val releaseFirst = CountDownLatch(1)
-        val laterWritten = CountDownLatch(40)
+        val laterWritten = CountDownLatch(80)
         val output = ExportDirectory(temporary.newFolder().toPath().resolve("sources"))
         val engine = ClassDecompiler { _, name, _ ->
             if (name == "0") { firstStarted.countDown(); check(releaseFirst.await(5, TimeUnit.SECONDS)) }
             DecompiledClass("class C$name {}")
         }
-        BatchParallelDecompiler(groups(80), engine, 2, {}, writeSource = { i, source, check ->
+        BatchParallelDecompiler(groups(120), engine, 2, {}, writeSource = { i, source, check ->
             output.source("C$i.java", source, check)
             if (i >= 40) laterWritten.countDown()
         }).use { pipeline ->
             try {
                 assertTrue(firstStarted.await(5, TimeUnit.SECONDS))
                 assertTrue("Later batch must not stall behind the first class", laterWritten.await(5, TimeUnit.SECONDS))
-                assertEquals("class C79 {}", Files.readString(output.root.resolve("C79.java")))
+                assertEquals("class C119 {}", Files.readString(output.root.resolve("C119.java")))
+                repeat(80) { assertTrue(pipeline.next().index >= 40) }
                 assertFalse(Files.exists(output.root.resolve("C0.java")))
             } finally { releaseFirst.countDown() }
-            repeat(80) { pipeline.next() }
+            repeat(40) { pipeline.next() }
         }
     }
 
@@ -124,11 +125,15 @@ class StreamingExportTest {
         }
     }
 
-    @Test fun `default native concurrency reserves IDE heap and never exceeds two workers`() {
+    @Test fun `automatic concurrency uses CPU times two ceiling and available heap budget`() {
         val mib = 1024L * 1024
-        assertEquals(1, BatchParallelDecompiler.parallelismFor(1024 * mib, 16))
-        assertEquals(2, BatchParallelDecompiler.parallelismFor(2048 * mib, 16))
-        assertEquals(2, BatchParallelDecompiler.parallelismFor(32768 * mib, 64))
-        assertEquals(1, BatchParallelDecompiler.parallelismFor(4096 * mib, 1))
+        assertEquals(2, BatchParallelDecompiler.parallelismFor(1024 * mib, 16))
+        assertEquals(6, BatchParallelDecompiler.parallelismFor(2048 * mib, 16))
+        assertEquals(96, BatchParallelDecompiler.parallelismFor(32768 * mib, 64))
+        assertEquals(2, BatchParallelDecompiler.parallelismFor(4096 * mib, 1))
+        assertEquals(4, BatchParallelDecompiler.parallelismFor(2048 * mib, 16, 512 * mib))
+        assertEquals(1, BatchParallelDecompiler.parallelismFor(2048 * mib, 16, 1800 * mib))
+        assertEquals(1, BatchParallelDecompiler.parallelismFor(256 * mib, 16))
+        assertEquals(32, BatchParallelDecompiler.analyzerParallelism(16))
     }
 }

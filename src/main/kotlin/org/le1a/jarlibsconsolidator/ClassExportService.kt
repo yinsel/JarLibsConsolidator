@@ -203,13 +203,19 @@ internal object ClassExportService {
                     written.incrementAndGet()
                 }
             }
+            if (processing != null) PluginDiagnostics.info("Export scheduler: families=${ordered.size}, batchSize=$batchSize, workers=${processing.workers}, completionOrder=true")
             processing.use {
-                for ((index, unit) in ordered.withIndex()) {
+                for (position in ordered.indices) {
+                    // Completion carries its own identity: reports never associate an out-of-order
+                    // result or failure with the class that happened to be submitted first.
+                    val completion = processing?.next()
+                    val index = completion?.index ?: position
+                    val unit = ordered[index]
                     val item = unit.root
                     val entryName = entries[index]
                     checkCanceled()
-                    progress("${if (decompiler == null) "复制" else "反编译并写入"}：${item.name}（已落盘 ${written.get()} 个文件）", 0.3 + 0.65 * index / ordered.size.coerceAtLeast(1))
-                    val result = try { processing?.next() }
+                    progress("${if (decompiler == null) "复制" else "反编译并写入"}：${item.name}（已落盘 ${written.get()} 个文件）", 0.3 + 0.65 * position / ordered.size.coerceAtLeast(1))
+                    val result = try { completion?.error?.let { throw it }; completion?.result }
                     catch (e: ExportWriteException) { throw e }
                     catch (e: Exception) {
                         val reason = failure(item.origin, e)

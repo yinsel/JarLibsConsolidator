@@ -302,6 +302,40 @@ class ClassExportServiceTest {
         assertFalse(entries(target).containsKey("decompilation-failures.csv"))
     }
 
+    @Test fun `out of order failures retain the correct class path and provenance`() {
+        val project = temporary.newFolder().toPath()
+        jar(project.resolve("slow.jar"), compile("Slow", "package demo; public class Slow {}"))
+        jar(project.resolve("fast.jar"), compile("Fast", "package demo; public class Fast {}"))
+        val fastStarted = java.util.concurrent.CountDownLatch(1)
+        val slowStarted = java.util.concurrent.CountDownLatch(1)
+        val target = project.resolve("sources")
+        val result = ClassExportService.export(project, listOf(project), target, ExportFilter(),
+            ClassDecompiler { _, name, _ ->
+                if (name == "demo/Fast") {
+                    fastStarted.countDown()
+                    check(slowStarted.await(5, TimeUnit.SECONDS))
+                    // Wait for the later task's completed source, forcing completion out of order.
+                    val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+                    while (!Files.exists(target.resolve("demo/Slow.java"))) {
+                        check(System.nanoTime() < deadline); Thread.yield()
+                    }
+                    throw IOException("failure-for-Fast")
+                }
+                slowStarted.countDown()
+                check(fastStarted.await(5, TimeUnit.SECONDS))
+                DecompiledClass("package demo; public class Slow {}")
+            }, parallelism = 2, batchSize = 1)
+        assertEquals(1, result.exported)
+        assertEquals(1, result.decompilationFailed)
+        val csv = Files.readString(target.resolve("decompilation-failures.csv"))
+        assertTrue(csv, csv.contains("demo.Fast") && csv.contains("fast.jar!/demo/Fast.class") && csv.contains("demo/Fast.java"))
+        assertFalse(csv, csv.contains("demo.Slow"))
+        assertEquals("package demo; public class Slow {}", Files.readString(target.resolve("demo/Slow.java")))
+        val sources = Files.readString(target.resolve("export-sources.tsv"))
+        assertTrue(sources, sources.contains("demo/Slow.java\t") && sources.contains("slow.jar!/demo/Slow.class"))
+        assertFalse(sources, sources.contains("Fast.java"))
+    }
+
     @Test fun `failure CSV retains every failed bytecode version of the same class`() {
         val project = temporary.newFolder().toPath()
         val libraries = listOf(jar(project.resolve("a.jar"), compile("Same", "public class Same { public int n() { return 1; } }")),

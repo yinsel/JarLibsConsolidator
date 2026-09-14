@@ -25,6 +25,7 @@ import java.awt.BorderLayout
 import java.awt.Dimension
 import java.awt.GridLayout
 import java.nio.file.Path
+import javax.swing.JComboBox
 import javax.swing.JComponent
 import javax.swing.JLabel
 import javax.swing.JPanel
@@ -52,6 +53,7 @@ internal abstract class BaseExportAction(private val javaSources: Boolean) : AnA
         val whitelist = options.whitelist.text
         val blacklist = options.blacklist.text
         val filter = ExportFilter(whitelist, blacklist)
+        val concurrencyMode = options.concurrency.selectedIndex
         ProgressManager.getInstance().run(object : Task.Backgroundable(project, if (javaSources) "反编译并导出 JAVA" else "导出 CLASS", true) {
             override fun run(indicator: ProgressIndicator) {
                 val started = System.nanoTime()
@@ -76,6 +78,11 @@ internal abstract class BaseExportAction(private val javaSources: Boolean) : AnA
                     }
                     PluginDiagnostics.debug { "Export registered libraries: ${libraries.joinToString()}" }
                     val result = ClassExportService.export(base, libraries, target, filter, decompiler(),
+                        parallelism = when (concurrencyMode) {
+                            1 -> BatchParallelDecompiler.analyzerParallelism()
+                            2 -> 1
+                            else -> BatchParallelDecompiler.defaultParallelism()
+                        },
                         checkCanceled = { indicator.checkCanceled() },
                         progress = { text, fraction ->
                             indicator.isIndeterminate = fraction < 0.3
@@ -113,9 +120,11 @@ internal abstract class BaseExportAction(private val javaSources: Boolean) : AnA
     override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.BGT
 }
 
-private class ExportOptionsDialog(project: Project, javaSources: Boolean) : DialogWrapper(project) {
+private class ExportOptionsDialog(project: Project, private val javaSources: Boolean) : DialogWrapper(project) {
     val whitelist = JTextArea(6, 35)
     val blacklist = JTextArea(6, 35)
+    val concurrency = JComboBox(arrayOf("自动（根据 CPU 和可用堆内存）",
+        "Jar Analyzer 并发（${BatchParallelDecompiler.analyzerParallelism()} 个任务，CPU × 2）", "低内存（1 个任务）"))
 
     init {
         title = if (javaSources) "一键反编译并导出 JAVA" else "一键导出 CLASS"
@@ -132,7 +141,12 @@ private class ExportOptionsDialog(project: Project, javaSources: Boolean) : Dial
         fields.add(JPanel(BorderLayout()).apply { add(JLabel("白名单（留空表示全部）"), BorderLayout.NORTH); add(JScrollPane(whitelist)) })
         fields.add(JPanel(BorderLayout()).apply { add(JLabel("黑名单（命中即排除）"), BorderLayout.NORTH); add(JScrollPane(blacklist)) })
         panel.add(fields, BorderLayout.CENTER)
-        panel.preferredSize = Dimension(780, 280)
+        if (javaSources) panel.add(JPanel(BorderLayout(8, 4)).apply {
+            add(JLabel("反编译并发"), BorderLayout.WEST)
+            add(concurrency, BorderLayout.CENTER)
+            add(JLabel("每批 40 个类族，完成即写入；提高并发会增加反编译期间的内存使用。"), BorderLayout.SOUTH)
+        }, BorderLayout.SOUTH)
+        panel.preferredSize = Dimension(780, if (javaSources) 340 else 280)
         return panel
     }
 }

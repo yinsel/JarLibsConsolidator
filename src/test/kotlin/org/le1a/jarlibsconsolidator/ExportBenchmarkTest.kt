@@ -28,7 +28,10 @@ class ExportBenchmarkTest {
         val target = project.resolve("batch")
         val previousWorkers = (Runtime.getRuntime().availableProcessors() - 1).coerceIn(1, 4)
         val batchWorkers = BatchParallelDecompiler.defaultParallelism()
-        val modes = listOf("serial", "previous", "batch-same-workers", "batch-native")
+        val oldDefaultWorkers = minOf(2, Runtime.getRuntime().availableProcessors(),
+            ((Runtime.getRuntime().maxMemory() - 512L * 1024 * 1024) / (512L * 1024 * 1024)).toInt().coerceAtLeast(1))
+        val analyzerWorkers = BatchParallelDecompiler.analyzerParallelism()
+        val modes = listOf("serial", "previous-default", "previous", "batch-same-workers", "batch-native", "analyzer-concurrency")
         val times = modes.associateWith { mutableListOf<Long>() }
         var expected: String? = null
         for (round in 0..3) for (offset in modes.indices) {
@@ -37,7 +40,13 @@ class ExportBenchmarkTest {
             val start = System.nanoTime()
             val result = ClassExportService.export(project, listOf(input), target, ExportFilter(),
                 IdeaJavaDecompiler(),
-                parallelism = if (mode == "serial") 1 else if (mode == "previous" || mode == "batch-same-workers") previousWorkers else batchWorkers,
+                parallelism = when (mode) {
+                    "serial" -> 1
+                    "previous-default" -> oldDefaultWorkers
+                    "previous", "batch-same-workers" -> previousWorkers
+                    "analyzer-concurrency" -> analyzerWorkers
+                    else -> batchWorkers
+                },
                 batchSize = if (mode == "previous") 1 else 40)
             val elapsed = (System.nanoTime() - start) / 1_000_000
             assertEquals(result.failures.toString(), 0, result.decompilationFailed)
@@ -46,14 +55,17 @@ class ExportBenchmarkTest {
             DirectoryOutput(target.toFile()).use { zip ->
                 zip.entries().asSequence().filter { it.name != "export-report.txt" }.forEach { entry ->
                     digest.update(entry.name.toByteArray(Charsets.UTF_8))
-                    digest.update(zip.getInputStream(entry).use { it.readBytes() })
+                    val bytes = zip.getInputStream(entry).use { it.readBytes() }
+                    // Completion order may differ; compare every provenance row, not row order.
+                    digest.update(if (entry.name == "export-sources.tsv") bytes.toString(Charsets.UTF_8)
+                        .lineSequence().sorted().joinToString("\n").toByteArray(Charsets.UTF_8) else bytes)
                 }
             }
             val actual = HexFormat.of().formatHex(digest.digest())
             if (expected == null) expected = actual else assertEquals("$mode source/order mismatch", expected, actual)
             if (round > 0) times.getValue(mode).add(elapsed)
         }
-        times.forEach { (mode, samples) -> println("BATCH_BENCHMARK mode=$mode medianMs=${samples.sorted()[1]} inputClasses=1600 families=800 oldWorkers=$previousWorkers batchWorkers=$batchWorkers") }
+        times.forEach { (mode, samples) -> println("BATCH_BENCHMARK mode=$mode medianMs=${samples.sorted()[1]} inputClasses=1600 families=800 oldWorkers=$previousWorkers oldDefaultWorkers=$oldDefaultWorkers batchWorkers=$batchWorkers analyzerWorkers=$analyzerWorkers") }
     }
 
     private fun fixtureFatJar(count: Int = 160): Path {

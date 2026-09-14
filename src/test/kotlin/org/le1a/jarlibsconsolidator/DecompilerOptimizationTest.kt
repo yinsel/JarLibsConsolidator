@@ -10,7 +10,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 class DecompilerOptimizationTest {
-    @Test fun `parallel scheduler bounds active work and preserves submission order`() {
+    @Test fun `parallel scheduler bounds active work and preserves result identity`() {
         val started = CountDownLatch(2)
         val active = AtomicInteger()
         val peak = AtomicInteger()
@@ -28,8 +28,12 @@ class DecompilerOptimizationTest {
         val sources = java.util.concurrent.ConcurrentHashMap<Int, String>()
         BatchParallelDecompiler(inputs.map { listOf(it) }, decompiler, 2, {}, batchSize = 1, writeSource = { i, text, _ -> sources[i] = text }).use { pipeline ->
             assertTrue(started.await(5, TimeUnit.SECONDS))
-            assertEquals(2, calls.get()) // No unbounded queue of completed sources.
-            inputs.forEachIndexed { i, input -> pipeline.next(); assertEquals(input.second, sources[i]) }
+            val seen = mutableSetOf<Int>()
+            repeat(inputs.size) {
+                val completion = pipeline.next()
+                assertTrue(seen.add(completion.index))
+                assertEquals(inputs[completion.index].second, sources[completion.index])
+            }
         }
         assertEquals(2, peak.get())
         assertEquals(0, active.get())
