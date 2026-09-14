@@ -196,6 +196,8 @@ class ClassExportServiceTest {
         val exported = ClassExportService.export(project, listOf(dependency), target, ExportFilter("Task", "Hidden"), engine)
         val files = entries(target)
         assertEquals(1, exported.exported)
+        assertEquals(0, exported.decompilationFailed)
+        assertFalse(files.containsKey("decompilation-failures.csv"))
         assertEquals(setOf("$name.java"), files.keys.filter { it.endsWith(".java") }.toSet())
         assertTrue(files.getValue("export-report.txt").toString(Charsets.UTF_8).contains("关闭泛型签名"))
         assertFalse(files.getValue("$name.java").toString(Charsets.UTF_8).contains("SHOULD_NOT_EXPORT"))
@@ -270,6 +272,51 @@ class ClassExportServiceTest {
         assertEquals(2, result.failures.size)
         assertTrue(result.failures.any { it.contains("java.io.IOException: test decompilation failure") })
         assertTrue(entries(target).getValue("export-report.txt").toString(Charsets.UTF_8).contains("test decompilation failure"))
+    }
+
+    @Test fun `failure CSV counts only final decompilation failures and preserves quoted multiline reasons`() {
+        val project = temporary.newFolder().toPath()
+        val good = jar(project.resolve("good.jar"), compile("Good", "package demo; public class Good {}"))
+        val bad = jar(project.resolve("=bad,quoted.jar"), compile("Bad", "package demo; public class Bad {}"))
+        val corrupt = Files.writeString(project.resolve("broken.class"), "invalid bytecode")
+        val target = project.resolve("export.zip")
+        val engine = ClassDecompiler { _, name, _ ->
+            if (name.endsWith("Bad")) throw IOException("失败, \"引号\"\n第二行", IllegalStateException("root cause"))
+            DecompiledClass("package demo; public class Good {}", listOf("warning only"))
+        }
+        val result = ClassExportService.export(project, listOf(good, bad, corrupt), target, ExportFilter(), engine)
+        val files = entries(target)
+        assertEquals(1, result.exported)
+        assertEquals(1, result.decompilationFailed)
+        assertEquals(3, result.failures.size)
+        val csv = files.getValue("decompilation-failures.csv")
+        assertArrayEquals(byteArrayOf(0xEF.toByte(), 0xBB.toByte(), 0xBF.toByte()), csv.take(3).toByteArray())
+        val text = csv.toString(Charsets.UTF_8)
+        assertTrue(text, text.contains("\"demo.Bad\",\"'=bad,quoted.jar!/demo/Bad.class\""))
+        assertTrue(text, text.contains("失败, \"\"引号\"\"\n第二行"))
+        assertTrue(text, text.contains("java.lang.IllegalStateException: root cause"))
+        assertFalse(text.contains("demo.Good"))
+        assertFalse(text.contains("broken.class"))
+        assertTrue(files.getValue("export-report.txt").toString(Charsets.UTF_8).contains("反编译失败: 1"))
+        // CLASS export never creates a decompilation-failure report, even with scan failures.
+        val classResult = ClassExportService.export(project, listOf(good, corrupt), target, ExportFilter())
+        assertEquals(0, classResult.decompilationFailed)
+        assertFalse(entries(target).containsKey("decompilation-failures.csv"))
+    }
+
+    @Test fun `failure CSV retains every failed bytecode version of the same class`() {
+        val project = temporary.newFolder().toPath()
+        val libraries = listOf(jar(project.resolve("a.jar"), compile("Same", "public class Same { public int n() { return 1; } }")),
+            jar(project.resolve("b.jar"), compile("Same", "public class Same { public int n() { return 2; } }")))
+        val target = project.resolve("export.zip")
+        val result = ClassExportService.export(project, libraries, target, ExportFilter(),
+            ClassDecompiler { _, _, _ -> throw IOException("failed") }, parallelism = 2)
+        assertEquals(2, result.decompilationFailed)
+        assertEquals(0, result.exported)
+        val csv = entries(target).getValue("decompilation-failures.csv").toString(Charsets.UTF_8)
+        assertEquals(3, csv.trimEnd().split("\r\n").size)
+        assertTrue(csv.contains("a.jar!/Same.class")); assertTrue(csv.contains("b.jar!/Same.class"))
+        assertEquals(2, Regex("classes-conflicts/").findAll(csv).count())
     }
 
     @Test fun `wrapped IDEA cancellation aborts export and preserves destination`() {

@@ -20,7 +20,9 @@ internal fun interface ClassDecompiler {
 
 /** IO-only export pipeline, separate from IntelliJ's UI and library discovery. */
 internal object ClassExportService {
-    data class Result(val discovered: Int, val filtered: Int, val duplicates: Int, val exported: Int, val failures: List<String>)
+    data class Result(val discovered: Int, val filtered: Int, val duplicates: Int, val exported: Int,
+                      val failures: List<String>, val decompilationFailed: Int = 0)
+    private data class DecompilationFailure(val item: Item, val entryName: String, val errorType: String, val reason: String)
     private data class Item(val name: String, val file: Path, val origin: String, val group: String, val digest: String)
 
     fun export(
@@ -43,6 +45,7 @@ internal object ClassExportService {
         var duplicates = 0
         var exported = 0
         val failures = mutableListOf<String>()
+        val decompilationFailures = mutableListOf<DecompilationFailure>()
         val items = mutableListOf<Item>()
         val seenFiles = mutableSetOf<Path>()
         val seenDirectories = mutableSetOf<Path>()
@@ -53,13 +56,15 @@ internal object ClassExportService {
             else "external/" + path.toList().takeLast(4).joinToString("/")
 
         var loggedFailures = 0
-        fun failure(origin: String, e: Exception) {
+        fun failure(origin: String, e: Exception): String {
             checkCanceled()
             PluginDiagnostics.rethrowCancellation(e)
-            failures.add("$origin: ${PluginDiagnostics.describe(e)}")
+            val reason = PluginDiagnostics.describe(e)
+            failures.add("$origin: $reason")
             // Bound default stack logging on damaged archives; DEBUG retains every failure.
             if (loggedFailures++ < 20) PluginDiagnostics.warn("Export item failed: origin=$origin, target=$destination", e)
             else PluginDiagnostics.debug("Export item failed: origin=$origin, target=$destination", e)
+            return reason
         }
 
         fun collect(origin: String, group: String, open: () -> InputStream) {
@@ -185,7 +190,11 @@ internal object ClassExportService {
                                 if (result.source.isBlank()) throw IOException("反编译器未生成源码")
                                 result.warnings.forEach { failures.add("${item.origin}: $it") }
                             }?.source
-                        } catch (e: Exception) { failure(item.origin, e); continue }
+                        } catch (e: Exception) {
+                            val reason = failure(item.origin, e) // Cancellation propagates before being counted.
+                            decompilationFailures.add(DecompilationFailure(item, entryName, e.javaClass.name, reason))
+                            continue
+                        }
                         checkCanceled()
                         PluginDiagnostics.debug { "Write ZIP entry: origin=${item.origin}, entry=$entryName, target=$destination" }
                         check(usedEntries.add(entryName)) { "重复的 ZIP 条目：$entryName" }
@@ -205,8 +214,23 @@ internal object ClassExportService {
                         report.add("${tsv(entryName)}\t${tsv(item.origin)}")
                     }
                     val summary = "扫描 class: $discovered\n已过滤: $filtered\n相同内容去重: $duplicates\n已导出文件: $exported\n失败/警告: ${failures.size}\n" +
-                            (if (decompiler == null) "" else "反编译引擎：IDEA 内置 Fernflower；内部类单独导出。\n") +
+                            (if (decompiler == null) "" else "反编译失败: ${decompilationFailures.size}\n反编译引擎：IDEA 内置 Fernflower；内部类单独导出。\n") +
                             failures.joinToString("\n")
+                    if (decompilationFailures.isNotEmpty()) {
+                        zip.putNextEntry(ZipEntry("decompilation-failures.csv"))
+                        // UTF-8 BOM helps Excel recognize Chinese text; write rows incrementally.
+                        zip.write(byteArrayOf(0xEF.toByte(), 0xBB.toByte(), 0xBF.toByte()))
+                        fun csvRow(values: List<String>) {
+                            checkCanceled()
+                            zip.write((values.joinToString(",", transform = ::csvCell) + "\r\n").toByteArray(Charsets.UTF_8))
+                        }
+                        csvRow(listOf("完整类名", "来源文件或JAR条目", "字节码SHA-256", "计划导出路径", "异常类型", "失败原因"))
+                        for ((item, entryName, errorType, reason) in decompilationFailures) {
+                            csvRow(listOf(item.name.replace('/', '.'), item.origin, item.digest, entryName,
+                                errorType, reason))
+                        }
+                        zip.closeEntry()
+                    }
                     for ((name, text) in listOf("export-report.txt" to summary, "export-sources.tsv" to report.joinToString("\n"))) {
                         zip.putNextEntry(ZipEntry(name)); zip.write(text.toByteArray(Charsets.UTF_8)); zip.closeEntry()
                     }
@@ -218,11 +242,18 @@ internal object ClassExportService {
             archive = null
             progress("导出完成", 1.0)
             if (failures.isNotEmpty()) PluginDiagnostics.warn("Export completed with ${failures.size} failures/warnings: target=$destination; see export-report.txt; first 20 exception stacks at WARN, remaining at DEBUG")
-            return Result(discovered, filtered, duplicates, exported, failures)
+            return Result(discovered, filtered, duplicates, exported, failures, decompilationFailures.size)
         } finally {
             archive?.let { Files.deleteIfExists(it) }
             work.toFile().deleteRecursively()
         }
+    }
+
+    private fun csvCell(value: String): String {
+        // CSV quoting handles separators/newlines; prefix formula-like data for spreadsheet viewers.
+        val first = value.trimStart().firstOrNull()
+        val safe = if (first in listOf('=', '+', '-', '@') || value.startsWith("\t") || value.startsWith("\r")) "'$value" else value
+        return "\"" + safe.replace("\"", "\"\"") + "\""
     }
 
     private fun tsv(text: String): String = text.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")

@@ -77,6 +77,25 @@ jobs:
         if: github.event_name == 'pull_request'
         run: ./gradlew --no-daemon test --tests '*ExportBenchmarkTest' --tests '*ScanBenchmarkTest' -PbenchmarkExports=true
 
+      - name: Build offline decompiler diagnostic kit
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/decompiler-kit
+          python3 tools/prepare_decompiler_kit.py
+          "$JAVA_HOME/bin/javac" -cp build/decompiler-kit/engine.jar -d build/decompiler-kit tools/DecompilerProbe.java
+          "$JAVA_HOME/bin/jlink" --add-modules java.base,java.logging,java.xml --strip-debug --no-header-files --no-man-pages --compress=2 --output build/decompiler-kit/jre
+          tar -czf build/decompiler-kit.tar.gz -C build decompiler-kit
+
+      - name: Upload offline diagnostic kit
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: decompiler-kit-${{ github.sha }}
+          path: build/decompiler-kit.tar.gz
+          if-no-files-found: error
+
   release:
     if: github.event_name == 'workflow_dispatch'
     needs: build

@@ -48,7 +48,7 @@ class ExportBenchmarkTest {
                 // Compare every Java file and the source mapping; ZIP timestamps are deliberately excluded.
                 val digest = MessageDigest.getInstance("SHA-256")
                 ZipFile(destination.toFile()).use { zip ->
-                    zip.entries().asSequence().filter { it.name != "export-report.txt" }.sortedBy { it.name }.forEach { entry ->
+                    zip.entries().asSequence().filter { it.name != "export-report.txt" && it.name != "decompilation-failures.csv" }.sortedBy { it.name }.forEach { entry ->
                         digest.update(entry.name.toByteArray(Charsets.UTF_8))
                         digest.update(zip.getInputStream(entry).use { it.readBytes() })
                     }
