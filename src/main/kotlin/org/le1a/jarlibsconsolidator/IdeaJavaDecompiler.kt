@@ -12,19 +12,22 @@ import java.nio.file.Path
 import java.util.jar.Manifest
 
 /** Uses the engine supplied by the installed IDEA Java Bytecode Decompiler plugin. */
-internal class IdeaJavaDecompiler(private val cache: DecompilationCache? = sessionCache) : ClassDecompiler {
+internal class IdeaJavaDecompiler(
+    private val cache: DecompilationCache? = sessionCache,
+    private val engine: IdeaDecompilationAttempt = BundledIdeaDecompilationAttempt
+) : ClassDecompiler {
     override fun decompile(file: Path, internalName: String, checkCanceled: () -> Unit): DecompiledClass {
         checkCanceled()
         val bytecode = Files.readAllBytes(file)
         val key = cache?.key(internalName, bytecode)
         if (key != null) cache?.get(key, bytecode)?.let { checkCanceled(); return it }
         val result = try {
-            attempt(file, internalName, bytecode, true, checkCanceled)
+            engine.decompile(file, internalName, bytecode, true, checkCanceled)
         } catch (first: IOException) {
             checkCanceled()
             PluginDiagnostics.debug("Retry IDEA decompiler without generic signatures: class=$internalName", first)
             val recovered = try {
-                attempt(file, internalName, bytecode, false, checkCanceled)
+                engine.decompile(file, internalName, bytecode, false, checkCanceled)
             } catch (second: IOException) {
                 second.addSuppressed(first)
                 throw second
@@ -39,7 +42,17 @@ internal class IdeaJavaDecompiler(private val cache: DecompilationCache? = sessi
         return result
     }
 
-    private fun attempt(
+    companion object { private val sessionCache = DecompilationCache() }
+}
+
+/** Separate retry policy from the installed engine so version-specific failures can be replayed. */
+internal fun interface IdeaDecompilationAttempt {
+    fun decompile(file: Path, internalName: String, bytecode: ByteArray,
+                  genericSignatures: Boolean, checkCanceled: () -> Unit): DecompiledClass
+}
+
+internal object BundledIdeaDecompilationAttempt : IdeaDecompilationAttempt {
+    override fun decompile(
         file: Path, internalName: String, bytecode: ByteArray,
         genericSignatures: Boolean, checkCanceled: () -> Unit
     ): DecompiledClass {
@@ -93,8 +106,11 @@ internal class IdeaJavaDecompiler(private val cache: DecompilationCache? = sessi
             IFernflowerPreferences.NEW_LINE_SEPARATOR to "1",
             IFernflowerPreferences.INDENT_STRING to "    "
         )
-        val engine = BaseDecompiler(provider, saver, options, logger, cancellation)
-        try { engine.addSource(file.toFile()); engine.decompileContext() }
+        try {
+            val engine = BaseDecompiler(provider, saver, options, logger, cancellation)
+            engine.addSource(file.toFile())
+            engine.decompileContext()
+        }
         catch (e: CancellationManager.CanceledException) { throw (e.cause as? RuntimeException ?: e) }
         catch (e: Exception) {
             PluginDiagnostics.rethrowCancellation(e)
@@ -107,5 +123,4 @@ internal class IdeaJavaDecompiler(private val cache: DecompilationCache? = sessi
         return DecompiledClass(text, warnings.toList())
     }
 
-    companion object { private val sessionCache = DecompilationCache() }
 }

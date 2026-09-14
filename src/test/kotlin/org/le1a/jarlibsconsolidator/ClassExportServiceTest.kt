@@ -168,15 +168,23 @@ class ClassExportServiceTest {
         }
     """.trimIndent())
 
-    @Test fun `generic inner constructor failure recovers real method bodies without leaking filtered classes`() {
+    // The build baseline (IDEA 2024.1) tolerates this signature. Replay the newer engine's
+    // reported failure, then run the real bundled engine with the actual fallback options.
+    private fun replayGenericFailure(): IdeaDecompilationAttempt = IdeaDecompilationAttempt { file, name, bytes, generic, check ->
+        if (generic) throw IOException("Inconsistent generic signature in method <init>: Index 7 out of bounds for length 7",
+            IndexOutOfBoundsException("Index 7 out of bounds for length 7"))
+        BundledIdeaDecompilationAttempt.decompile(file, name, bytes, generic, check)
+    }
+
+    @Test fun `reported generic failure retries real engine without leaking filtered classes`() {
         val project = temporary.newFolder().toPath()
         val classes = genericInnerFixture()
         val name = "demo/GenericOuter\$Task"
         val input = classes.resolve("$name.class")
-        val original = assertThrows(IOException::class.java) { LegacyIdeaJavaDecompiler().decompile(input, name) {} }
-        assertTrue(original.message, original.message!!.contains("generic signature", ignoreCase = true))
+        val normal = IdeaJavaDecompiler(null).decompile(input, name) {}
+        assertTrue(normal.source, normal.source.contains("return 42;"))
         val cache = DecompilationCache()
-        val engine = IdeaJavaDecompiler(cache)
+        val engine = IdeaJavaDecompiler(cache, replayGenericFailure())
         val result = engine.decompile(input, name) {}
         assertTrue(result.source, result.source.contains("return 42;"))
         assertTrue(result.source, result.source.contains("names.size()"))
@@ -198,7 +206,7 @@ class ClassExportServiceTest {
         val libraries = listOf(jar(project.resolve("first.jar"), genericInnerFixture(41)),
             jar(project.resolve("second.jar"), genericInnerFixture(42)))
         val target = project.resolve("sources.zip")
-        val result = ClassExportService.export(project, libraries, target, ExportFilter("Task"), IdeaJavaDecompiler(null), parallelism = 2)
+        val result = ClassExportService.export(project, libraries, target, ExportFilter("Task"), IdeaJavaDecompiler(null, replayGenericFailure()), parallelism = 2)
         val sources = entries(target).filterKeys { it.endsWith(".java") }
         assertEquals(result.failures.toString(), 2, result.exported)
         assertTrue(sources.keys.all { it.startsWith("classes-conflicts/") })
@@ -211,7 +219,7 @@ class ClassExportServiceTest {
         val name = "demo/GenericOuter\$Task"
         val canceled = CancellationException("stop fallback")
         val error = assertThrows(CancellationException::class.java) {
-            IdeaJavaDecompiler(null).decompile(classes.resolve("$name.class"), name) {
+            IdeaJavaDecompiler(null, replayGenericFailure()).decompile(classes.resolve("$name.class"), name) {
                 if (org.jetbrains.java.decompiler.main.DecompilerContext.getCurrentContext() != null &&
                     !org.jetbrains.java.decompiler.main.DecompilerContext.getOption(
                         org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences.DECOMPILE_GENERIC_SIGNATURES)) throw canceled
@@ -219,6 +227,19 @@ class ClassExportServiceTest {
         }
         assertSame(canceled, error)
         assertNull(org.jetbrains.java.decompiler.main.DecompilerContext.getCurrentContext())
+    }
+
+    @Test fun `successful generic decompilation uses one attempt and preserves type arguments`() {
+        val classes = compile("Generic", "package demo; public class Generic { public java.util.List<String> names() { return java.util.Collections.emptyList(); } }")
+        var attempts = 0
+        val engine = IdeaDecompilationAttempt { file, name, bytes, generic, check ->
+            attempts++
+            assertTrue(generic)
+            BundledIdeaDecompilationAttempt.decompile(file, name, bytes, generic, check)
+        }
+        val result = IdeaJavaDecompiler(null, engine).decompile(classes.resolve("demo/Generic.class"), "demo/Generic") {}
+        assertEquals(1, attempts)
+        assertTrue(result.source, result.source.contains("List<String>"))
     }
 
     @Test fun `both failed attempts retain diagnostic causes and never cache empty source`() {
