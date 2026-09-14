@@ -108,5 +108,20 @@ class ParameterIncrementNormalizerTest {
         assertFalse(result.source.contains("Couldn't be decompiled"))
         assertTrue(result.source.contains("observed"))
         assertArrayEquals(original, Files.readAllBytes(file))
+        // Execute only this synthetic fixture, never user-supplied bytecode.
+        val source = file.resolveSibling("ParameterBranch.java")
+        Files.writeString(source, result.source)
+        val output = Files.createDirectories(file.parent.resolve("roundtrip"))
+        val log = output.resolve("javac.log")
+        val process = ProcessBuilder(System.getProperty("test.javac"), "--release", "17", "-d", output.toString(), source.toString())
+            .redirectErrorStream(true).redirectOutput(log.toFile()).start()
+        assertTrue(process.waitFor(30, TimeUnit.SECONDS))
+        assertEquals(Files.readString(log), 0, process.exitValue())
+        val before = load(original).getMethod("adjust", Int::class.javaPrimitiveType, Boolean::class.javaPrimitiveType)
+        val after = load(Files.readAllBytes(output.resolve("ParameterBranch.class")))
+            .getMethod("adjust", Int::class.javaPrimitiveType, Boolean::class.javaPrimitiveType)
+        for (value in listOf(Int.MIN_VALUE, Int.MAX_VALUE, -1, 0, 1, 2, 3, 100)) {
+            for (flag in listOf(false, true)) assertEquals(before.invoke(null, value, flag), after.invoke(null, value, flag))
+        }
     }
 }
