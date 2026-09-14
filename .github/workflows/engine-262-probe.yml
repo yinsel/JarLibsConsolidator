@@ -1,0 +1,44 @@
+name: Build IDEA 262 diagnostic engine
+
+on:
+  pull_request:
+    paths: ['.github/workflows/engine-262-probe.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostic-engine:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: JetBrains/intellij-community
+          ref: 1c7e601c0423e544917046c23763b15d0282e2a3
+          sparse-checkout: plugins/java-decompiler/engine
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Build public engine and local diagnostic runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p kit/classes
+          curl --fail --location --retry 3 https://repo.maven.apache.org/maven2/org/jetbrains/annotations/26.1.0/annotations-26.1.0.jar -o kit/annotations.jar
+          find plugins/java-decompiler/engine/src -name '*.java' > kit/sources.txt
+          javac --release 21 -cp kit/annotations.jar -d kit/classes @kit/sources.txt
+          jar --create --file kit/engine.jar -C kit/classes .
+          jlink --add-modules java.base,java.logging,java.xml,jdk.compiler,jdk.jdeps --strip-debug --no-header-files --no-man-pages --compress=2 --output kit/jre
+          cp plugins/java-decompiler/engine/LICENSE.txt kit/LICENSE.txt
+          cp plugins/java-decompiler/engine/NOTICE.txt kit/NOTICE.txt
+          printf '%s\n' 'Public IDEA 262.10315.125 engine, source 1c7e601c0423e544917046c23763b15d0282e2a3. Private samples are never uploaded.' > kit/README.txt
+          rm -r kit/classes kit/sources.txt
+          tar -czf engine-262-kit.tar.gz kit
+      - uses: actions/upload-artifact@v4
+        with:
+          name: engine-262-kit
+          path: engine-262-kit.tar.gz
+          if-no-files-found: error
