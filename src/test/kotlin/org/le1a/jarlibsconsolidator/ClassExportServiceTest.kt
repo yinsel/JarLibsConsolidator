@@ -150,6 +150,90 @@ class ClassExportServiceTest {
         assertFalse(sources.values.any { "SHOULD_NOT_EXPORT" in it.toString(Charsets.UTF_8) })
     }
 
+    private fun genericInnerFixture(value: Int = 42): Path = compile("GenericOuter", """
+        package demo;
+        import java.util.List;
+        import java.util.concurrent.atomic.AtomicBoolean;
+        public class GenericOuter {
+            public String outerSecret() { return "OUTER_SHOULD_NOT_EXPORT"; }
+            public class Task {
+                private final List<String> names;
+                public Task(String a, String b, String c, AtomicBoolean d, List<String> names, int e, Long f) {
+                    this.names = names;
+                }
+                public int value() { return $value; }
+                public int size() { return names.size(); }
+            }
+            public static class Hidden { public String secret() { return "HIDDEN_SHOULD_NOT_EXPORT"; } }
+        }
+    """.trimIndent())
+
+    @Test fun `generic inner constructor failure recovers real method bodies without leaking filtered classes`() {
+        val project = temporary.newFolder().toPath()
+        val classes = genericInnerFixture()
+        val name = "demo/GenericOuter\$Task"
+        val input = classes.resolve("$name.class")
+        val original = assertThrows(IOException::class.java) { LegacyIdeaJavaDecompiler().decompile(input, name) {} }
+        assertTrue(original.message, original.message!!.contains("generic signature", ignoreCase = true))
+        val cache = DecompilationCache()
+        val engine = IdeaJavaDecompiler(cache)
+        val result = engine.decompile(input, name) {}
+        assertTrue(result.source, result.source.contains("return 42;"))
+        assertTrue(result.source, result.source.contains("names.size()"))
+        assertTrue(result.warnings.toString(), result.warnings.any { it.contains("关闭泛型签名") })
+        val bytecode = Files.readAllBytes(input)
+        assertNull(cache.get(cache.key(name, bytecode), bytecode))
+        val dependency = jar(project.resolve("generic.jar"), classes)
+        val target = project.resolve("sources.zip")
+        val exported = ClassExportService.export(project, listOf(dependency), target, ExportFilter("Task", "Hidden"), engine)
+        val files = entries(target)
+        assertEquals(1, exported.exported)
+        assertEquals(setOf("$name.java"), files.keys.filter { it.endsWith(".java") }.toSet())
+        assertTrue(files.getValue("export-report.txt").toString(Charsets.UTF_8).contains("关闭泛型签名"))
+        assertFalse(files.getValue("$name.java").toString(Charsets.UTF_8).contains("SHOULD_NOT_EXPORT"))
+    }
+
+    @Test fun `parallel generic fallback retains distinct versions of the same inner class`() {
+        val project = temporary.newFolder().toPath()
+        val libraries = listOf(jar(project.resolve("first.jar"), genericInnerFixture(41)),
+            jar(project.resolve("second.jar"), genericInnerFixture(42)))
+        val target = project.resolve("sources.zip")
+        val result = ClassExportService.export(project, libraries, target, ExportFilter("Task"), IdeaJavaDecompiler(null), parallelism = 2)
+        val sources = entries(target).filterKeys { it.endsWith(".java") }
+        assertEquals(result.failures.toString(), 2, result.exported)
+        assertTrue(sources.keys.all { it.startsWith("classes-conflicts/") })
+        assertTrue(sources.values.any { "return 41;" in it.toString(Charsets.UTF_8) })
+        assertTrue(sources.values.any { "return 42;" in it.toString(Charsets.UTF_8) })
+    }
+
+    @Test fun `cancellation inside fallback engine propagates and clears thread context`() {
+        val classes = genericInnerFixture()
+        val name = "demo/GenericOuter\$Task"
+        val canceled = CancellationException("stop fallback")
+        val error = assertThrows(CancellationException::class.java) {
+            IdeaJavaDecompiler(null).decompile(classes.resolve("$name.class"), name) {
+                if (org.jetbrains.java.decompiler.main.DecompilerContext.getCurrentContext() != null &&
+                    !org.jetbrains.java.decompiler.main.DecompilerContext.getOption(
+                        org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences.DECOMPILE_GENERIC_SIGNATURES)) throw canceled
+            }
+        }
+        assertSame(canceled, error)
+        assertNull(org.jetbrains.java.decompiler.main.DecompilerContext.getCurrentContext())
+    }
+
+    @Test fun `both failed attempts retain diagnostic causes and never cache empty source`() {
+        val file = temporary.newFile("Broken.class").toPath()
+        Files.write(file, byteArrayOf(0, 1, 2))
+        val cache = DecompilationCache()
+        val error = assertThrows(IOException::class.java) { IdeaJavaDecompiler(cache).decompile(file, "Broken") {} }
+        assertEquals(1, error.suppressed.size)
+        assertTrue(error.message, error.message!!.contains("genericSignatures=false"))
+        assertTrue(error.suppressed.single().message!!.contains("genericSignatures=true"))
+        val bytes = Files.readAllBytes(file)
+        assertNull(cache.get(cache.key("Broken", bytes), bytes))
+        assertNull(org.jetbrains.java.decompiler.main.DecompilerContext.getCurrentContext())
+    }
+
     @Test fun `corrupt class and individual decompile failures are reported without corrupting zip`() {
         val project = temporary.newFolder().toPath()
         jar(project.resolve("a.jar"), compile("Good", "package demo; public class Good {}"))
