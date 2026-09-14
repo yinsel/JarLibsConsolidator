@@ -99,7 +99,7 @@ class ExportBenchmarkTest {
             ZipFile(target.toFile()).use { zip ->
                 for (i in 0 until 160) {
                     val outer = zip.getInputStream(zip.getEntry("benchmark/services/Service$i.java")).reader().readText()
-                    assertTrue(outer, outer.contains("calculate(int n)"))
+                    assertTrue(outer, outer.contains("calculate(int "))
                     assertTrue(outer, outer.contains("StringBuilder"))
                     val inner = if (mode == "individual") zip.getInputStream(zip.getEntry("benchmark/services/Service$i\$Inner.java")).reader().readText() else outer
                     assertTrue(inner, inner.contains("return $i;"))

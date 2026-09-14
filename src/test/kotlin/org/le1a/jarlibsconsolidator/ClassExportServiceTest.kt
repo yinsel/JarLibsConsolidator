@@ -193,6 +193,27 @@ class ClassExportServiceTest {
         assertTrue(Files.exists(compile("Outer", source).resolve("demo/Outer.class")))
     }
 
+    @Test fun `selected nested family can export when its enclosing outer is filtered out`() {
+        val project = temporary.newFolder().toPath()
+        val classes = compile("Outer", """
+            package demo;
+            public class Outer {
+                public String secret() { return "FILTERED_OUTER_BODY"; }
+                public static class Branch {
+                    public int value() { return 81; }
+                    public static class Leaf { public int value() { return 82; } }
+                }
+            }
+        """.trimIndent())
+        val target = project.resolve("sources.zip")
+        val result = ClassExportService.export(project, listOf(classes), target, ExportFilter("Branch"), IdeaJavaDecompiler(null))
+        assertEquals(result.failures.toString(), 1, result.exported)
+        assertEquals(0, result.decompilationFailed)
+        val source = entries(target).getValue("demo/Outer\$Branch.java").toString(Charsets.UTF_8)
+        assertTrue(source, "return 81;" in source && "return 82;" in source)
+        assertFalse(source, "FILTERED_OUTER_BODY" in source)
+    }
+
     @Test fun `failed family writes a CSV row for every selected member`() {
         val project = temporary.newFolder().toPath()
         val classes = compile("Outer", "package demo; public class Outer { public static class Inner {} }")
