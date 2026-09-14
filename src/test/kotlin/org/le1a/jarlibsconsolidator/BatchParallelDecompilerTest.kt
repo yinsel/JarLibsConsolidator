@@ -22,7 +22,8 @@ class BatchParallelDecompilerTest {
             threads[index] = Thread.currentThread().name + ":" + Thread.currentThread().id
             if (index == 0 || index == 40) { started.countDown(); check(started.await(5, TimeUnit.SECONDS)) }
             if (index == 13 || index == 41) throw IOException("broken-$index")
-            DecompiledClass("source-$index", if (index == 17) listOf("warning") else emptyList())
+            DecompiledClass("source-$index", if (index == 17) listOf("warning") else emptyList(),
+                if (index == 18) listOf(DecompilationIssue("18", "IOException", "method failed")) else emptyList())
         }
         BatchParallelDecompiler(inputs(83), decompiler, 2, {}, memoryBudget = 1).use { pipeline ->
             for (i in 0 until 83) {
@@ -31,6 +32,7 @@ class BatchParallelDecompilerTest {
                     val result = pipeline.next()
                     assertEquals("source-$i", result.source)
                     assertEquals(if (i == 17) listOf("warning") else emptyList<String>(), result.warnings)
+                    assertEquals(if (i == 18) listOf(DecompilationIssue("18", "IOException", "method failed")) else emptyList<DecompilationIssue>(), result.issues)
                 }
             }
         }
