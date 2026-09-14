@@ -162,7 +162,7 @@ class ClassExportServiceTest {
         val copy = Files.copy(first, project.resolve("copy.jar"))
         val target = project.resolve("sources.zip")
         val cache = DecompilationCache()
-        val result = ClassExportService.export(project, listOf(first, second, copy), target, ExportFilter(), IdeaJavaDecompiler(cache), parallelism = 2)
+        val result = ClassExportService.export(project, listOf(first, second, copy), target, ExportFilter(), IdeaJavaDecompiler(cache), parallelism = 2, batchSize = 1)
         assertEquals(result.failures.toString(), 2, result.exported)
         val sources = entries(target).filterKeys { it.endsWith(".java") }
         assertTrue(sources.keys.all { it.startsWith("classes-conflicts/") && it.endsWith("demo/Outer.java") })
@@ -298,7 +298,7 @@ class ClassExportServiceTest {
         val libraries = listOf(jar(project.resolve("first.jar"), genericInnerFixture(41)),
             jar(project.resolve("second.jar"), genericInnerFixture(42)))
         val target = project.resolve("sources.zip")
-        val result = ClassExportService.export(project, libraries, target, ExportFilter("Task"), IdeaJavaDecompiler(null, replayGenericFailure()), parallelism = 2)
+        val result = ClassExportService.export(project, libraries, target, ExportFilter("Task"), IdeaJavaDecompiler(null, replayGenericFailure()), parallelism = 2, batchSize = 1)
         val sources = entries(target).filterKeys { it.endsWith(".java") }
         assertEquals(result.failures.toString(), 2, result.exported)
         assertTrue(sources.keys.all { it.startsWith("classes-conflicts/") })
@@ -400,7 +400,7 @@ class ClassExportServiceTest {
             jar(project.resolve("b.jar"), compile("Same", "public class Same { public int n() { return 2; } }")))
         val target = project.resolve("export.zip")
         val result = ClassExportService.export(project, libraries, target, ExportFilter(),
-            ClassDecompiler { _, _, _ -> throw IOException("failed") }, parallelism = 2)
+            ClassDecompiler { _, _, _ -> throw IOException("failed") }, parallelism = 2, batchSize = 1)
         assertEquals(2, result.decompilationFailed)
         assertEquals(0, result.exported)
         val csv = entries(target).getValue("decompilation-failures.csv").toString(Charsets.UTF_8)
@@ -455,7 +455,7 @@ class ClassExportServiceTest {
         }
         assertThrows(CancellationException::class.java) {
             ClassExportService.export(project, listOf(project), target, ExportFilter(), decompiler,
-                checkCanceled = { if (cancel.get()) throw CancellationException() }, parallelism = 2)
+                checkCanceled = { if (cancel.get()) throw CancellationException() }, parallelism = 2, batchSize = 1)
         }
         assertEquals(0, active.get())
         assertEquals("original", Files.readString(target))

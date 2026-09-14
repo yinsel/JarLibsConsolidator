@@ -39,7 +39,8 @@ internal object ClassExportService {
         decompiler: ClassDecompiler? = null,
         checkCanceled: () -> Unit = {},
         progress: (String, Double) -> Unit = { _, _ -> },
-        parallelism: Int = OrderedParallelDecompiler.defaultParallelism()
+        parallelism: Int = BatchParallelDecompiler.defaultParallelism(),
+        batchSize: Int = 40
     ): Result {
         require(libraries.isNotEmpty()) { "没有已登记的依赖库，请先执行“一键添加依赖”后再导出。" }
         val base = project.toAbsolutePath().normalize()
@@ -182,9 +183,11 @@ internal object ClassExportService {
             val usedEntries = mutableSetOf<String>()
             val ordered = exportUnits(items, decompiler?.mergeInnerClasses == true, checkCanceled)
             val outputVersions = ordered.groupingBy { it.root.name }.eachCount()
-            val processing = decompiler?.let {
-                OrderedParallelDecompiler(ordered.map { unit -> unit.root.file to unit.root.name }, it, parallelism,
-                    checkCanceled, ordered.map { unit -> unit.members.map { it.file to it.name } })
+            val processing: DecompilationPipeline? = decompiler?.let {
+                val groups = ordered.map { unit -> unit.members.map { member -> member.file to member.name } }
+                if (batchSize == 1) OrderedParallelDecompiler(ordered.map { unit -> unit.root.file to unit.root.name },
+                    it, parallelism, checkCanceled, groups)
+                else BatchParallelDecompiler(groups, it, parallelism, checkCanceled, batchSize)
             }
             processing.use {
                 ZipOutputStream(Files.newOutputStream(archive)).use { zip ->

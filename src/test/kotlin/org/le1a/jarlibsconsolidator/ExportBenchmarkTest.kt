@@ -41,7 +41,7 @@ class ExportBenchmarkTest {
                     count = result.exported; warnings = result.failures.size
                 } else {
                     val result = ClassExportService.export(project, listOf(input), destination, ExportFilter(),
-                        IdeaJavaDecompiler(if (mode == "cached") cache else DecompilationCache(), mergeInnerClasses = false), parallelism = workers)
+                        IdeaJavaDecompiler(if (mode == "cached") cache else DecompilationCache(), mergeInnerClasses = false), parallelism = workers, batchSize = 1)
                     count = result.exported; warnings = result.failures.size
                 }
                 val elapsed = (System.nanoTime() - start) / 1_000_000
@@ -92,7 +92,8 @@ class ExportBenchmarkTest {
                 else -> warm
             }
             val start = System.nanoTime()
-            val result = ClassExportService.export(project, listOf(input), target, ExportFilter(), decompiler)
+            val result = ClassExportService.export(project, listOf(input), target, ExportFilter(), decompiler,
+                parallelism = OrderedParallelDecompiler.defaultParallelism(), batchSize = 1)
             val elapsed = (System.nanoTime() - start) / 1_000_000
             assertEquals(result.failures.toString(), 0, result.decompilationFailed)
             assertEquals(if (mode == "individual") 320 else 160, result.exported)
@@ -111,11 +112,46 @@ class ExportBenchmarkTest {
         times.forEach { (mode, samples) -> println("FAMILY_BENCHMARK mode=$mode medianMs=${samples.sorted()[1]} inputClasses=320") }
     }
 
-    private fun fixtureFatJar(): Path {
+    @Test fun `compare ordered families with forty-family parallel batches`() {
+        assumeTrue(java.lang.Boolean.getBoolean("benchmark.exports"))
+        val project = temporary.newFolder().toPath()
+        val input = fixtureFatJar(800)
+        val target = project.resolve("batch.zip")
+        val previousWorkers = OrderedParallelDecompiler.defaultParallelism()
+        val batchWorkers = BatchParallelDecompiler.defaultParallelism()
+        val cache = DecompilationCache()
+        val modes = listOf("previous", "batch-same-workers", "batch-cold", "batch-cached")
+        val times = modes.associateWith { mutableListOf<Long>() }
+        var expected: String? = null
+        for (round in 0..3) for (offset in modes.indices) {
+            val mode = modes[(round + offset) % modes.size]
+            val start = System.nanoTime()
+            val result = ClassExportService.export(project, listOf(input), target, ExportFilter(),
+                IdeaJavaDecompiler(if (mode == "batch-cached") cache else null),
+                parallelism = if (mode == "previous" || mode == "batch-same-workers") previousWorkers else batchWorkers,
+                batchSize = if (mode == "previous") 1 else 40)
+            val elapsed = (System.nanoTime() - start) / 1_000_000
+            assertEquals(result.failures.toString(), 0, result.decompilationFailed)
+            assertEquals(800, result.exported)
+            val digest = MessageDigest.getInstance("SHA-256")
+            ZipFile(target.toFile()).use { zip ->
+                zip.entries().asSequence().filter { it.name != "export-report.txt" }.forEach { entry ->
+                    digest.update(entry.name.toByteArray(Charsets.UTF_8))
+                    digest.update(zip.getInputStream(entry).use { it.readBytes() })
+                }
+            }
+            val actual = HexFormat.of().formatHex(digest.digest())
+            if (expected == null) expected = actual else assertEquals("$mode source/order mismatch", expected, actual)
+            if (round > 0) times.getValue(mode).add(elapsed)
+        }
+        times.forEach { (mode, samples) -> println("BATCH_BENCHMARK mode=$mode medianMs=${samples.sorted()[1]} inputClasses=1600 families=800 oldWorkers=$previousWorkers batchWorkers=$batchWorkers") }
+    }
+
+    private fun fixtureFatJar(count: Int = 160): Path {
         val folder = temporary.newFolder().toPath()
         val sources = Files.createDirectories(folder.resolve("sources"))
         val classes = Files.createDirectories(folder.resolve("classes"))
-        for (i in 0 until 160) Files.writeString(sources.resolve("Service$i.java"), """
+        for (i in 0 until count) Files.writeString(sources.resolve("Service$i.java"), """
             package benchmark.services;
             public class Service$i {
                 public int calculate(int n) { int sum = $i; for (int k=0; k<n; k++) { switch(k % 3) { case 0: sum += k; break; case 1: sum -= k; break; default: sum ^= k; } } return sum; }
