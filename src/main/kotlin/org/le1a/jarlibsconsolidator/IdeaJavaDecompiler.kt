@@ -7,6 +7,7 @@ import com.intellij.ide.highlighter.JavaClassFileType
 import com.intellij.ide.util.PropertiesComponent
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.progress.ProgressManager
+import com.intellij.openapi.progress.ProcessCanceledException
 import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.progress.util.ProgressIndicatorBase
 import com.intellij.openapi.vfs.JarFileSystem
@@ -16,6 +17,7 @@ import com.intellij.psi.compiled.ClassFileDecompilers
 import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.Path
+import java.util.concurrent.CancellationException
 
 /** An original loose class or an entry in an original (possibly staged nested) JAR. */
 internal data class ClassSource(val container: Path, val entry: String? = null)
@@ -110,9 +112,20 @@ internal object EditorIdeaText : NativeIdeaText {
         // Native cancellation uses a thread-local ProgressIndicator. Each worker gets its own indicator.
         val delegate = ProgressIndicatorBase()
         val indicator = object : ProgressIndicator by delegate {
-            override fun checkCanceled() { checkCanceled.invoke(); delegate.checkCanceled() }
+            override fun checkCanceled() {
+                try { checkCanceled.invoke() }
+                catch (e: CancellationException) { throw ProcessCanceledException(e) }
+                delegate.checkCanceled()
+            }
+            override fun isCanceled(): Boolean {
+                try { checkCanceled() } catch (_: ProcessCanceledException) { return true }
+                return delegate.isCanceled
+            }
         }
-        ProgressManager.getInstance().runProcess(Runnable { text = native.getText(file).toString() }, indicator)
+        ProgressManager.getInstance().runProcess(Runnable {
+            indicator.checkCanceled()
+            text = native.getText(file).toString()
+        }, indicator)
         checkCanceled()
         return text ?: throw IOException("IDEA 原生反编译没有返回结果：${file.url}")
     }
