@@ -240,6 +240,76 @@ class ClassExportServiceTest {
         assertEquals(result.failures.toString(), 2, result.exported)
     }
 
+    @Test fun `loose family at registered directory root merges into one source`() {
+        val project = temporary.newFolder().toPath()
+        val compiled = compile("Outer", "package demo; public class Outer { public static class Inner { public int value() { return 91; } } }")
+        Files.copy(compiled.resolve("demo/Outer.class"), project.resolve("Outer.class"))
+        Files.copy(compiled.resolve("demo/Outer\$Inner.class"), project.resolve("Outer\$Inner.class"))
+        val target = project.resolve("sources.zip")
+        val result = ClassExportService.export(project, listOf(project), target, ExportFilter(), IdeaJavaDecompiler(null))
+        assertEquals(result.failures.toString(), 1, result.exported)
+        assertEquals(0, result.decompilationFailed)
+        val sources = entries(target).filterKeys { it.endsWith(".java") }
+        assertEquals(setOf("demo/Outer.java"), sources.keys)
+        assertTrue(sources.getValue("demo/Outer.java").toString(Charsets.UTF_8).contains("return 91;"))
+    }
+
+    @Test fun `partial family keeps healthy methods and records only its failed member in CSV`() {
+        val project = temporary.newFolder().toPath()
+        val classes = compile("Outer", "package demo; public class Outer { public static class Inner { public int ok() { return 91; } } }")
+        val calls = java.util.concurrent.atomic.AtomicInteger()
+        val source = "package demo; public class Outer { public int ok() { return 73; } public void broken() { /* Couldn't be decompiled */ } public static class Inner { public int ok() { return 91; } } }"
+        val attempt = object : IdeaDecompilationAttempt {
+            override fun decompile(file: Path, internalName: String, bytecode: ByteArray, genericSignatures: Boolean,
+                                   checkCanceled: () -> Unit): DecompiledClass = error("expected family")
+            override fun decompileGroup(inputs: List<Pair<Path, String>>, bytes: List<ByteArray>, genericSignatures: Boolean,
+                                        checkCanceled: () -> Unit): DecompiledClass {
+                calls.incrementAndGet()
+                val issue = DecompilationIssue("demo/Outer", "java.lang.NullPointerException",
+                    "Method broken ()V in class demo/Outer couldn't be decompiled: vers is null")
+                throw PartialDecompilationException(DecompiledClass(source, issues = listOf(issue)), NullPointerException("vers is null"))
+            }
+        }
+        val cache = DecompilationCache()
+        val target = project.resolve("sources.zip")
+        repeat(2) {
+            val result = ClassExportService.export(project, listOf(classes), target, ExportFilter(), IdeaJavaDecompiler(cache, attempt))
+            assertEquals(1, result.exported)
+            assertEquals(1, result.partiallyExported)
+            assertEquals(1, result.decompilationFailed)
+            val files = entries(target)
+            val java = files.getValue("demo/Outer.java").toString(Charsets.UTF_8)
+            assertTrue(java.startsWith("// WARNING: Partial decompilation"))
+            assertTrue(java.contains("return 73;") && java.contains("return 91;"))
+            val csv = files.getValue("decompilation-failures.csv").toString(Charsets.UTF_8)
+            assertTrue(csv.contains("broken ()V"))
+            assertFalse(csv.contains("demo.Outer\$Inner"))
+            assertTrue(files.getValue("export-report.txt").toString(Charsets.UTF_8).contains("已保留部分源码文件: 1"))
+        }
+        assertEquals("Incomplete source must never enter the clean cache", 4, calls.get())
+    }
+
+    @Test fun `partial first attempt is retained if retry emits no source but cancellation still propagates`() {
+        val classes = compile("One", "package demo; public class One {}")
+        val issue = DecompilationIssue("demo/One", "java.lang.NullPointerException", "method failed")
+        val first = DecompiledClass("class One { void broken() {} }", issues = listOf(issue))
+        val attempt = IdeaDecompilationAttempt { _, _, _, generic, _ ->
+            if (generic) throw PartialDecompilationException(first, NullPointerException("vers"))
+            throw IOException("No source on retry")
+        }
+        val result = IdeaJavaDecompiler(null, attempt).decompile(classes.resolve("demo/One.class"), "demo/One") {}
+        assertEquals(listOf(issue), result.issues)
+        assertTrue(result.source.contains(first.source))
+        val cancel = CancellationException("stop")
+        val cancelAttempt = IdeaDecompilationAttempt { _, _, _, generic, _ ->
+            if (generic) throw PartialDecompilationException(first, NullPointerException("vers"))
+            throw cancel
+        }
+        assertSame(cancel, assertThrows(CancellationException::class.java) {
+            IdeaJavaDecompiler(null, cancelAttempt).decompile(classes.resolve("demo/One.class"), "demo/One") {}
+        })
+    }
+
     private fun genericInnerFixture(value: Int = 42): Path = compile("GenericOuter", """
         package demo;
         import java.util.List;

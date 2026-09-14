@@ -13,7 +13,9 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
 
-internal data class DecompiledClass(val source: String, val warnings: List<String> = emptyList())
+internal data class DecompilationIssue(val internalName: String?, val errorType: String, val reason: String)
+internal data class DecompiledClass(val source: String, val warnings: List<String> = emptyList(),
+                                   val issues: List<DecompilationIssue> = emptyList())
 internal fun interface ClassDecompiler {
     fun decompile(file: Path, internalName: String, checkCanceled: () -> Unit): DecompiledClass
     val mergeInnerClasses: Boolean get() = false
@@ -26,7 +28,7 @@ internal fun interface ClassDecompiler {
 /** IO-only export pipeline, separate from IntelliJ's UI and library discovery. */
 internal object ClassExportService {
     data class Result(val discovered: Int, val filtered: Int, val duplicates: Int, val exported: Int,
-                      val failures: List<String>, val decompilationFailed: Int = 0)
+                      val failures: List<String>, val decompilationFailed: Int = 0, val partiallyExported: Int = 0)
     private data class DecompilationFailure(val item: Item, val entryName: String, val errorType: String, val reason: String)
     private data class Item(val name: String, val file: Path, val origin: String, val group: String, val digest: String)
     private data class UnitOfWork(val members: List<Item>, val digest: String) { val root get() = members.first() }
@@ -51,6 +53,7 @@ internal object ClassExportService {
         var filtered = 0
         var duplicates = 0
         var exported = 0
+        var partiallyExported = 0
         val failures = mutableListOf<String>()
         val decompilationFailures = mutableListOf<DecompilationFailure>()
         val items = mutableListOf<Item>()
@@ -205,6 +208,18 @@ internal object ClassExportService {
                             processing?.next()?.also { result ->
                                 if (result.source.isBlank()) throw IOException("反编译器未生成源码")
                                 result.warnings.forEach { failures.add("${item.origin}: $it") }
+                                if (result.issues.isNotEmpty()) {
+                                    partiallyExported++
+                                    for (member in unit.members) {
+                                        val issues = result.issues.filter { issue -> issue.internalName == member.name ||
+                                            unit.members.none { it.name == issue.internalName } }
+                                        if (issues.isEmpty()) continue
+                                        val reason = issues.joinToString("\n") { it.reason }
+                                        failures.add("${member.origin}: 部分源码，存在失败的方法：$reason")
+                                        decompilationFailures.add(DecompilationFailure(member, entryName,
+                                            issues.map { it.errorType }.distinct().joinToString("; "), reason))
+                                    }
+                                }
                             }?.source
                         } catch (e: Exception) {
                             val reason = failure(item.origin, e) // Cancellation propagates before being counted.
@@ -232,7 +247,7 @@ internal object ClassExportService {
                         unit.members.forEach { report.add("${tsv(entryName)}\t${tsv(it.origin)}") }
                     }
                     val summary = "扫描 class: $discovered\n已过滤: $filtered\n相同内容去重: $duplicates\n已导出文件: $exported\n失败/警告: ${failures.size}\n" +
-                            (if (decompiler == null) "" else "反编译失败: ${decompilationFailures.size}\n反编译引擎：IDEA 内置 Fernflower；同一来源且命中过滤的内部类合并导出，缺少选中的外部类时单独导出。\n") +
+                            (if (decompiler == null) "" else "反编译失败: ${decompilationFailures.size}\n已保留部分源码文件: $partiallyExported（包含失败的方法，不代表完整成功）\n反编译引擎：IDEA 内置 Fernflower；同一来源且命中过滤的内部类合并导出，缺少选中的外部类时单独导出。\n") +
                             failures.joinToString("\n")
                     if (decompilationFailures.isNotEmpty()) {
                         zip.putNextEntry(ZipEntry("decompilation-failures.csv"))
@@ -260,7 +275,7 @@ internal object ClassExportService {
             archive = null
             progress("导出完成", 1.0)
             if (failures.isNotEmpty()) PluginDiagnostics.warn("Export completed with ${failures.size} failures/warnings: target=$destination; see export-report.txt; first 20 exception stacks at WARN, remaining at DEBUG")
-            return Result(discovered, filtered, duplicates, exported, failures, decompilationFailures.size)
+            return Result(discovered, filtered, duplicates, exported, failures, decompilationFailures.size, partiallyExported)
         } finally {
             archive?.let { Files.deleteIfExists(it) }
             work.toFile().deleteRecursively()
@@ -273,7 +288,7 @@ internal object ClassExportService {
         val units = mutableListOf<UnitOfWork>()
         val parents = mutableMapOf<Path, String?>()
         // The containing directory/JAR entry directory isolates multi-release and shaded copies too.
-        for (scope in items.groupBy { it.origin.substringBeforeLast('/') }.values) {
+        for (scope in items.groupBy { it.origin.substringBeforeLast('/', "") }.values) {
             val byName = scope.groupBy { it.name }
             val buckets = linkedMapOf<Item, MutableList<Item>>()
             for (item in scope) {

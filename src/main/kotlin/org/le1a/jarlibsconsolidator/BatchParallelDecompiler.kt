@@ -27,6 +27,7 @@ internal class BatchParallelDecompiler(
 ) : DecompilationPipeline {
     private data class Outcome(var source: String? = null, val file: Path? = null,
                                val warnings: List<String> = emptyList(), val error: Exception? = null,
+                               val issues: List<DecompilationIssue> = emptyList(),
                                val weight: Long = 0)
     init { require(batchSize > 0) }
     private val stopped = AtomicBoolean()
@@ -54,12 +55,12 @@ internal class BatchParallelDecompiler(
     private fun retain(result: DecompiledClass): Outcome {
         val weight = result.source.length * 2L + 128L
         val total = retained.addAndGet(weight)
-        if (total <= memoryBudget) return Outcome(source = result.source, warnings = result.warnings, weight = weight)
+        if (total <= memoryBudget) return Outcome(source = result.source, warnings = result.warnings, issues = result.issues, weight = weight)
         retained.addAndGet(-weight)
         // Bound completed source retention independently of CPU count and batch count.
         val file = Files.createTempFile(staging, "source-", ".txt")
         Files.writeString(file, result.source)
-        return Outcome(file = file, warnings = result.warnings)
+        return Outcome(file = file, warnings = result.warnings, issues = result.issues)
     }
 
     private fun submit() {
@@ -102,7 +103,7 @@ internal class BatchParallelDecompiler(
         try {
             item.error?.let { throw it }
             val source = item.source ?: Files.readString(item.file!!)
-            return DecompiledClass(source, item.warnings)
+            return DecompiledClass(source, item.warnings, item.issues)
         } finally {
             item.source = null
             retained.addAndGet(-item.weight)

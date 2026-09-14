@@ -17,7 +17,7 @@ internal class DecompilationCache(private val maxBytes: Long = 32L * 1024 * 1024
 
     @Synchronized fun put(key: String, input: ByteArray, result: DecompiledClass) {
         // Do not preserve partial/failed decompilations or warnings between attempts.
-        if (result.source.isBlank() || result.warnings.isNotEmpty()) return
+        if (result.source.isBlank() || result.warnings.isNotEmpty() || result.issues.isNotEmpty()) return
         val weight = input.size.toLong() + result.source.length * 2L + key.length * 2L + 256L
         if (weight > maxBytes || maxEntries <= 0) return
         entries.remove(key)?.let { bytes -= it.weight }

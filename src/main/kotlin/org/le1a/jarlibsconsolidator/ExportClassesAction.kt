@@ -86,6 +86,7 @@ internal abstract class BaseExportAction(private val javaSources: Boolean) : AnA
                     ApplicationManager.getApplication().invokeLater {
                         if (!project.isDisposed) {
                             val message = "已导出 ${result.exported} 个文件\n扫描 ${result.discovered} 个 class，过滤 ${result.filtered} 个，相同内容去重 ${result.duplicates} 个\n" +
+                                    (if (result.partiallyExported > 0) "其中 ${result.partiallyExported} 个为部分源码（存在失败的方法）\n" else "") +
                                     (if (javaSources) "反编译失败：${result.decompilationFailed} 个\n" +
                                         (if (result.decompilationFailed > 0) "失败明细见 ZIP 内 decompilation-failures.csv\n" else "") else "") +
                                     "全部失败/警告 ${result.failures.size} 项，详细列表见 ZIP 内 export-report.txt\n\n$target"

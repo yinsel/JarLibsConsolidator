@@ -6,6 +6,12 @@ import zipfile
 
 out = Path('build/decompiler-kit')
 roots = [Path.cwd(), Path(os.environ.get('GRADLE_USER_HOME', str(Path.home() / '.gradle')))]
+# Public runtime dependency for invoking the built plugin's IO-only export path locally.
+for root in roots:
+    candidates = list(root.glob('**/kotlin-stdlib-1.9.25.jar'))
+    if candidates:
+        shutil.copyfile(candidates[0], out / 'kotlin-stdlib.jar')
+        break
 for root in roots:
     for folder, _, names in os.walk(root):
         for name in names:

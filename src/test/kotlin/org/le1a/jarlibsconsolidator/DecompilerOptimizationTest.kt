@@ -33,6 +33,8 @@ class DecompilerOptimizationTest {
         cache.put("large", input, DecompiledClass("x".repeat(1000)))
         cache.put("warning", input, DecompiledClass("source", listOf("partial")))
         cache.put("blank", input, DecompiledClass(" "))
+        cache.put("partial", input, DecompiledClass("source", issues = listOf(DecompilationIssue(null, "IOException", "failed"))))
+        assertNull(cache.get("partial", input))
         assertNull(cache.get("large", input)); assertNull(cache.get("warning", input)); assertNull(cache.get("blank", input))
     }
 

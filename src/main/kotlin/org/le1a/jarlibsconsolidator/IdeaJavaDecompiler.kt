@@ -11,6 +11,10 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.util.jar.Manifest
 
+/** A saver may produce the healthy methods even when Fernflower fails another method. */
+internal class PartialDecompilationException(val partial: DecompiledClass, cause: Throwable) :
+    IOException("IDEA 仅生成部分源码：${partial.issues.joinToString { it.reason }}", cause)
+
 /** Uses the engine supplied by the installed IDEA Java Bytecode Decompiler plugin. */
 internal class IdeaJavaDecompiler(
     private val cache: DecompilationCache? = sessionCache,
@@ -32,14 +36,8 @@ internal class IdeaJavaDecompiler(
         } else null
         val key = cacheInput?.let { cache?.key("family:" + inputs[0].second, it) }
         if (key != null && cacheInput != null) cache?.get(key, cacheInput)?.let { checkCanceled(); return it }
-        val result = try {
-            engine.decompileGroup(inputs, bytes, true, checkCanceled)
-        } catch (first: IOException) {
-            checkCanceled()
-            PluginDiagnostics.debug("Retry IDEA class family without generic signatures: class=${inputs[0].second}", first)
-            val recovered = try { engine.decompileGroup(inputs, bytes, false, checkCanceled) }
-            catch (second: IOException) { second.addSuppressed(first); throw second }
-            recovered.copy(warnings = listOf("已关闭泛型签名重建后恢复导出；泛型类型信息可能退化为原始类型。首次失败：${first.message}") + recovered.warnings)
+        val result = withRetry(inputs[0].second, checkCanceled) { generic ->
+            engine.decompileGroup(inputs, bytes, generic, checkCanceled)
         }
         checkCanceled()
         if (key != null && cacheInput != null) cache?.put(key, cacheInput, result)
@@ -51,25 +49,39 @@ internal class IdeaJavaDecompiler(
         val bytecode = Files.readAllBytes(file)
         val key = cache?.key(internalName, bytecode)
         if (key != null) cache?.get(key, bytecode)?.let { checkCanceled(); return it }
-        val result = try {
-            engine.decompile(file, internalName, bytecode, true, checkCanceled)
-        } catch (first: IOException) {
-            checkCanceled()
-            PluginDiagnostics.debug("Retry IDEA decompiler without generic signatures: class=$internalName", first)
-            val recovered = try {
-                engine.decompile(file, internalName, bytecode, false, checkCanceled)
-            } catch (second: IOException) {
-                second.addSuppressed(first)
-                throw second
-            }
-            recovered.copy(warnings = listOf(
-                "已关闭泛型签名重建后恢复导出（仍使用 IDEA 内置引擎）；泛型类型信息可能退化为原始类型。首次失败：${first.message}"
-            ) + recovered.warnings)
+        val result = withRetry(internalName, checkCanceled) { generic ->
+            engine.decompile(file, internalName, bytecode, generic, checkCanceled)
         }
         checkCanceled()
         // Warning-bearing fallback results are intentionally not cached as clean successes.
         if (key != null) cache?.put(key, bytecode, result)
         return result
+    }
+
+    private fun withRetry(name: String, checkCanceled: () -> Unit,
+                          attempt: (Boolean) -> DecompiledClass): DecompiledClass {
+        try { return attempt(true) }
+        catch (first: IOException) {
+            checkCanceled()
+            PluginDiagnostics.debug("Retry IDEA decompiler without generic signatures: class=$name", first)
+            val recovered = try {
+                attempt(false)
+            } catch (second: IOException) {
+                checkCanceled()
+                second.addSuppressed(first)
+                // Prefer the original attempt on ties, preserving its generic type information.
+                val partial = listOfNotNull((first as? PartialDecompilationException)?.partial,
+                    (second as? PartialDecompilationException)?.partial)
+                    .filter { it.source.isNotBlank() && it.issues.isNotEmpty() }
+                    .minByOrNull { it.issues.size } ?: throw second
+                PluginDiagnostics.debug("Both attempts incomplete; retaining partial source: class=$name", second)
+                return partial.copy(source = "// WARNING: Partial decompilation; failed methods are listed in decompilation-failures.csv.\n" + partial.source,
+                    warnings = listOf("两次尝试后仍有方法失败，已保留部分源码；这不是完整成功，失败明细见 decompilation-failures.csv。") + partial.warnings)
+            }
+            return recovered.copy(warnings = listOf(
+                "已关闭泛型签名重建后恢复导出（仍使用 IDEA 内置引擎）；泛型类型信息可能退化为原始类型。首次失败：${first.message}"
+            ) + recovered.warnings)
+        }
     }
 
     companion object { private val sessionCache = DecompilationCache() }
@@ -100,6 +112,7 @@ internal object BundledIdeaDecompilationAttempt : IdeaDecompilationAttempt {
         checkCanceled()
         var source: String? = null
         val warnings = mutableListOf<String>()
+        val issues = mutableListOf<DecompilationIssue>()
         var engineFailure: Throwable? = null
         val saver = object : IResultSaver {
             override fun saveClassFile(path: String?, qualifiedName: String?, entryName: String?, content: String?, mapping: IntArray?) {
@@ -122,6 +135,13 @@ internal object BundledIdeaDecompilationAttempt : IdeaDecompilationAttempt {
                 if (t is CancellationManager.CanceledException) throw t
                 PluginDiagnostics.rethrowCancellation(t)
                 if (severity >= Severity.WARN && engineFailure == null) engineFailure = t
+                if (severity >= Severity.WARN) {
+                    val name = inputs.firstOrNull { (_, candidate) ->
+                        message.contains(" in class $candidate couldn't be decompiled") ||
+                            message.startsWith("Class $candidate ")
+                    }?.second
+                    issues.add(DecompilationIssue(name, t.javaClass.name, "$message: ${PluginDiagnostics.describe(t)}"))
+                }
                 writeMessage("$message: ${t.javaClass.name}: ${t.message}", severity)
             }
         }
@@ -159,9 +179,9 @@ internal object BundledIdeaDecompilationAttempt : IdeaDecompilationAttempt {
         }
         finally { org.jetbrains.java.decompiler.main.DecompilerContext.setCurrentContext(null) }
         checkCanceled()
-        if (engineFailure != null) throw IOException("IDEA 反编译器未完整生成 $internalName 的源码（genericSignatures=$genericSignatures）：${warnings.joinToString()}", engineFailure)
         val text = source?.takeIf { it.isNotBlank() }
             ?: throw IOException("IDEA 反编译器没有生成 $internalName 的源码（genericSignatures=$genericSignatures）：${warnings.joinToString()}", engineFailure)
+        if (engineFailure != null) throw PartialDecompilationException(DecompiledClass(text, warnings.toList(), issues.toList()), engineFailure!!)
         return DecompiledClass(text, warnings.toList())
     }
 
