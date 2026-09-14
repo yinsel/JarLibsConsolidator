@@ -41,14 +41,14 @@ class ExportBenchmarkTest {
                     count = result.exported; warnings = result.failures.size
                 } else {
                     val result = ClassExportService.export(project, listOf(input), destination, ExportFilter(),
-                        IdeaJavaDecompiler(if (mode == "cached") cache else DecompilationCache()), parallelism = workers)
+                        IdeaJavaDecompiler(if (mode == "cached") cache else DecompilationCache(), mergeInnerClasses = false), parallelism = workers)
                     count = result.exported; warnings = result.failures.size
                 }
                 val elapsed = (System.nanoTime() - start) / 1_000_000
                 // Compare every Java file and the source mapping; ZIP timestamps are deliberately excluded.
                 val digest = MessageDigest.getInstance("SHA-256")
                 ZipFile(destination.toFile()).use { zip ->
-                    zip.entries().asSequence().filter { it.name != "export-report.txt" }.sortedBy { it.name }.forEach { entry ->
+                    zip.entries().asSequence().filter { it.name != "export-report.txt" && it.name != "decompilation-failures.csv" }.sortedBy { it.name }.forEach { entry ->
                         digest.update(entry.name.toByteArray(Charsets.UTF_8))
                         digest.update(zip.getInputStream(entry).use { it.readBytes() })
                     }
@@ -76,6 +76,39 @@ class ExportBenchmarkTest {
             }
             for ((mode, values) in times) println("BENCHMARK median dataset=$label mode=$mode ms=${values.sorted()[1]} classes=${expected.exported}")
         }
+    }
+
+    @Test fun `measure family export cold and warm with all inner method bodies retained`() {
+        assumeTrue(java.lang.Boolean.getBoolean("benchmark.exports"))
+        val input = fixtureFatJar()
+        val project = temporary.newFolder().toPath()
+        val target = project.resolve("families.zip")
+        val warm = IdeaJavaDecompiler(DecompilationCache())
+        val times = linkedMapOf("individual" to mutableListOf<Long>(), "family-cold" to mutableListOf<Long>(), "family-cached" to mutableListOf<Long>())
+        for (round in 0..3) for (mode in times.keys) {
+            val decompiler = when (mode) {
+                "individual" -> IdeaJavaDecompiler(null, mergeInnerClasses = false)
+                "family-cold" -> IdeaJavaDecompiler(null)
+                else -> warm
+            }
+            val start = System.nanoTime()
+            val result = ClassExportService.export(project, listOf(input), target, ExportFilter(), decompiler)
+            val elapsed = (System.nanoTime() - start) / 1_000_000
+            assertEquals(result.failures.toString(), 0, result.decompilationFailed)
+            assertEquals(if (mode == "individual") 320 else 160, result.exported)
+            ZipFile(target.toFile()).use { zip ->
+                for (i in 0 until 160) {
+                    val outer = zip.getInputStream(zip.getEntry("benchmark/services/Service$i.java")).reader().readText()
+                    assertTrue(outer, outer.contains("calculate(int "))
+                    assertTrue(outer, outer.contains("StringBuilder"))
+                    val inner = if (mode == "individual") zip.getInputStream(zip.getEntry("benchmark/services/Service$i\$Inner.java")).reader().readText() else outer
+                    assertTrue(inner, inner.contains("return $i;"))
+                }
+                assertEquals(321, zip.getInputStream(zip.getEntry("export-sources.tsv")).reader().readText().lines().size)
+            }
+            if (round > 0) times.getValue(mode).add(elapsed)
+        }
+        times.forEach { (mode, samples) -> println("FAMILY_BENCHMARK mode=$mode medianMs=${samples.sorted()[1]} inputClasses=320") }
     }
 
     private fun fixtureFatJar(): Path {

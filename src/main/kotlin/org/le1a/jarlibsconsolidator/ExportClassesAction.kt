@@ -82,11 +82,13 @@ internal abstract class BaseExportAction(private val javaSources: Boolean) : AnA
                             indicator.text = text
                             if (fraction >= 0.3) indicator.fraction = fraction
                         })
-                    PluginDiagnostics.info("Export complete: target=$target, discovered=${result.discovered}, filtered=${result.filtered}, duplicates=${result.duplicates}, exported=${result.exported}, failures=${result.failures.size}, elapsedMs=${(System.nanoTime() - started) / 1_000_000}")
+                    PluginDiagnostics.info("Export complete: target=$target, discovered=${result.discovered}, filtered=${result.filtered}, duplicates=${result.duplicates}, exported=${result.exported}, failures=${result.failures.size}, decompilationFailed=${result.decompilationFailed}, elapsedMs=${(System.nanoTime() - started) / 1_000_000}")
                     ApplicationManager.getApplication().invokeLater {
                         if (!project.isDisposed) {
                             val message = "已导出 ${result.exported} 个文件\n扫描 ${result.discovered} 个 class，过滤 ${result.filtered} 个，相同内容去重 ${result.duplicates} 个\n" +
-                                    "失败/警告 ${result.failures.size} 项，详细列表见 ZIP 内 export-report.txt\n\n$target"
+                                    (if (javaSources) "反编译失败：${result.decompilationFailed} 个\n" +
+                                        (if (result.decompilationFailed > 0) "失败明细见 ZIP 内 decompilation-failures.csv\n" else "") else "") +
+                                    "全部失败/警告 ${result.failures.size} 项，详细列表见 ZIP 内 export-report.txt\n\n$target"
                             if (result.failures.isEmpty()) Messages.showInfoMessage(project, message, "导出完成")
                             else Messages.showWarningDialog(project, message, "导出完成（有失败或警告）")
                         }

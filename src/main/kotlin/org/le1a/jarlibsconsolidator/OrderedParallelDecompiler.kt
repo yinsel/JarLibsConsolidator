@@ -15,7 +15,8 @@ internal class OrderedParallelDecompiler(
     private val inputs: List<Pair<Path, String>>,
     private val decompiler: ClassDecompiler,
     parallelism: Int,
-    private val checkCanceled: () -> Unit
+    private val checkCanceled: () -> Unit,
+    private val groups: List<List<Pair<Path, String>>>? = null
 ) : AutoCloseable {
     private val stopped = AtomicBoolean()
     private val workers = parallelism.coerceIn(1, 4)
@@ -35,18 +36,22 @@ internal class OrderedParallelDecompiler(
 
     private fun submit() {
         if (pool == null || submitted >= inputs.size) return
-        val (path, name) = inputs[submitted++]
+        val index = submitted++
+        val (path, name) = inputs[index]
         pending.addLast(pool.submit<DecompiledClass> {
             checkWorkerCanceled()
-            decompiler.decompile(path, name, ::checkWorkerCanceled)
+            groups?.let { decompiler.decompileGroup(it[index], ::checkWorkerCanceled) }
+                ?: decompiler.decompile(path, name, ::checkWorkerCanceled)
         })
     }
 
     fun next(): DecompiledClass {
         checkCanceled()
         if (pool == null) {
-            val (path, name) = inputs[consumed++]
-            return decompiler.decompile(path, name, checkCanceled)
+            val index = consumed++
+            val (path, name) = inputs[index]
+            return groups?.let { decompiler.decompileGroup(it[index], checkCanceled) }
+                ?: decompiler.decompile(path, name, checkCanceled)
         }
         val future = pending.first
         try {

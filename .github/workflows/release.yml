@@ -77,6 +77,71 @@ jobs:
         if: github.event_name == 'pull_request'
         run: ./gradlew --no-daemon test --tests '*ExportBenchmarkTest' --tests '*ScanBenchmarkTest' -PbenchmarkExports=true
 
+      - name: Build offline decompiler diagnostic kit
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/decompiler-kit
+          python3 tools/prepare_decompiler_kit.py
+          "$JAVA_HOME/bin/javac" -cp build/decompiler-kit/engine.jar -d build/decompiler-kit tools/DecompilerProbe.java
+          "$JAVA_HOME/bin/jlink" --add-modules java.base,java.logging,java.xml --strip-debug --no-header-files --no-man-pages --compress=2 --output build/decompiler-kit/jre
+          tar -czf build/decompiler-kit.tar.gz -C build decompiler-kit
+
+      - name: Upload offline diagnostic kit
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: decompiler-kit-${{ github.sha }}
+          path: build/decompiler-kit.tar.gz
+          if-no-files-found: error
+
+  cleanup-merged-branches:
+    # One-time, explicit consolidation marker; ordinary main pushes never delete branches.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, '[consolidate-branches]')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Delete the consolidated feature and fix branches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          branches=(
+            feat/class-file-libraries
+            feat/export-class-java-zip
+            fix/decompiler-generic-fallback
+            fix/exception-debug-logging
+            fix/existing-class-target
+            fix/ide-262-manual-release
+            fix/merge-class-roots
+          )
+          for branch in "${branches[@]}"; do
+            ref="refs/remotes/origin/$branch"
+            if ! git show-ref --verify --quiet "$ref"; then continue; fi
+            expected=$(git rev-parse "$ref")
+            git merge-base --is-ancestor "$expected" HEAD || {
+              echo "::error::Unmerged branch retained: $branch"
+              exit 1
+            }
+            current=$(gh api "repos/$GH_REPO/git/ref/heads/$branch" --jq '.object.sha')
+            if [[ "$current" != "$expected" ]]; then
+              echo "::error::Branch changed during cleanup; retained: $branch"
+              exit 1
+            fi
+            gh api --method DELETE "repos/$GH_REPO/git/refs/heads/$branch"
+            echo "Deleted merged branch: $branch ($expected)"
+          done
+
   release:
     if: github.event_name == 'workflow_dispatch'
     needs: build
