@@ -240,6 +240,20 @@ class ClassExportServiceTest {
         assertEquals(result.failures.toString(), 2, result.exported)
     }
 
+    @Test fun `loose family at registered directory root merges into one source`() {
+        val project = temporary.newFolder().toPath()
+        val compiled = compile("Outer", "package demo; public class Outer { public static class Inner { public int value() { return 91; } } }")
+        Files.copy(compiled.resolve("demo/Outer.class"), project.resolve("Outer.class"))
+        Files.copy(compiled.resolve("demo/Outer\$Inner.class"), project.resolve("Outer\$Inner.class"))
+        val target = project.resolve("sources.zip")
+        val result = ClassExportService.export(project, listOf(project), target, ExportFilter(), IdeaJavaDecompiler(null))
+        assertEquals(result.failures.toString(), 1, result.exported)
+        assertEquals(0, result.decompilationFailed)
+        val sources = entries(target).filterKeys { it.endsWith(".java") }
+        assertEquals(setOf("demo/Outer.java"), sources.keys)
+        assertTrue(sources.getValue("demo/Outer.java").toString(Charsets.UTF_8).contains("return 91;"))
+    }
+
     @Test fun `partial family keeps healthy methods and records only its failed member in CSV`() {
         val project = temporary.newFolder().toPath()
         val classes = compile("Outer", "package demo; public class Outer { public static class Inner { public int ok() { return 91; } } }")

@@ -288,7 +288,7 @@ internal object ClassExportService {
         val units = mutableListOf<UnitOfWork>()
         val parents = mutableMapOf<Path, String?>()
         // The containing directory/JAR entry directory isolates multi-release and shaded copies too.
-        for (scope in items.groupBy { it.origin.substringBeforeLast('/') }.values) {
+        for (scope in items.groupBy { it.origin.substringBeforeLast('/', "") }.values) {
             val byName = scope.groupBy { it.name }
             val buckets = linkedMapOf<Item, MutableList<Item>>()
             for (item in scope) {
