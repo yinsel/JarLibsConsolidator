@@ -1,9 +1,13 @@
 package org.le1a.jarlibsconsolidator
 
+import com.intellij.lang.java.lexer.JavaLexer
+import com.intellij.pom.java.LanguageLevel
+import com.intellij.psi.JavaTokenType
 import com.intellij.ide.highlighter.JavaClassFileType
 import com.intellij.ide.util.PropertiesComponent
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.progress.ProgressManager
+import com.intellij.openapi.progress.ProgressIndicator
 import com.intellij.openapi.progress.util.ProgressIndicatorBase
 import com.intellij.openapi.vfs.JarFileSystem
 import com.intellij.openapi.vfs.LocalFileSystem
@@ -48,16 +52,25 @@ internal class IdeaJavaDecompiler(private val nativeText: NativeIdeaText = Edito
         if (text.isBlank()) throw IOException("IDEA 原生反编译入口未返回源码：${root.second}")
         // IDEA logs method failures but still returns partial source. Keep its text byte-for-byte.
         // The public editor API does not expose method diagnostics: do not invent exception types or attribution.
-        val issues = text.lineSequence().mapIndexedNotNull { index, line ->
-            val comment = line.trim()
-            if (comment.startsWith("// \$FF:") &&
-                (comment.contains("Couldn't be decompiled", ignoreCase = true) ||
-                    comment.contains("decompilation", ignoreCase = true) &&
-                    (comment.contains("limit", ignoreCase = true) || comment.contains("failed", ignoreCase = true)))) {
-                DecompilationIssue(root.second, "IDEA.NativePartialSource",
-                    "IDEA 原生源码第 ${index + 1} 行：$comment；属于该源码文件，具体失败类/方法及异常堆栈见 idea.log。")
-            } else null
-        }.toList()
+        val issues = mutableListOf<DecompilationIssue>()
+        val lexer = JavaLexer(LanguageLevel.HIGHEST)
+        lexer.start(text)
+        var line = 1
+        var position = 0
+        while (lexer.tokenType != null) {
+            checkCanceled()
+            if (lexer.tokenType == JavaTokenType.END_OF_LINE_COMMENT) {
+                val comment = text.substring(lexer.tokenStart, lexer.tokenEnd)
+                if (comment.startsWith("// \$FF:") &&
+                    (comment.contains("Couldn't be decompiled", ignoreCase = true) ||
+                        comment.contains("Limits for ") && comment.contains(" are exceeded."))) {
+                    while (position < lexer.tokenStart) { if (text[position++] == '\n') line++ }
+                    issues.add(DecompilationIssue(root.second, "IDEA.NativePartialSource",
+                        "IDEA 原生源码第 $line 行：$comment；属于该源码文件，具体失败类/方法及异常堆栈见 idea.log。"))
+                }
+            }
+            lexer.advance()
+        }
         return DecompiledClass(text, issues = issues)
     }
 }
@@ -95,8 +108,9 @@ internal object EditorIdeaText : NativeIdeaText {
         }
         var text: String? = null
         // Native cancellation uses a thread-local ProgressIndicator. Each worker gets its own indicator.
-        val indicator = object : ProgressIndicatorBase() {
-            override fun checkCanceled() { checkCanceled.invoke(); super.checkCanceled() }
+        val delegate = ProgressIndicatorBase()
+        val indicator = object : ProgressIndicator by delegate {
+            override fun checkCanceled() { checkCanceled.invoke(); delegate.checkCanceled() }
         }
         ProgressManager.getInstance().runProcess(Runnable { text = native.getText(file).toString() }, indicator)
         checkCanceled()

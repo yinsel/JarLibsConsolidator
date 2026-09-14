@@ -109,6 +109,15 @@ class NativeIdeaDecompilerTest {
         assertEquals("Every export calls the native entry; no plugin cache or retry", 2, calls)
     }
 
+    @Test fun `failure-like text inside string literals is not counted but native limits are`() {
+        val file = temporary.newFile("One.class").toPath()
+        val source = "class One { String text = \"\"\"\n// \$FF: Couldn't be decompiled\n\"\"\";\nvoid broken() {\n// \$FF: Limits for direct nodes are exceeded. Current value: 2, limit: 1\n} }"
+        val result = IdeaJavaDecompiler(NativeIdeaText { _, _, _ -> source }).decompile(file, "One") {}
+        assertEquals(source, result.source)
+        assertEquals(1, result.issues.size)
+        assertTrue(result.issues.single().reason.contains("Limits for direct nodes"))
+    }
+
     @Test fun `native exceptions and cancellation are propagated without retry`() {
         val file = temporary.newFile("One.class").toPath()
         for (error in listOf(IOException("native failure"), CancellationException("cancel"))) {
