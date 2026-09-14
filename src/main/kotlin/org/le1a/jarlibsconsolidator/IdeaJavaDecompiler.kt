@@ -107,12 +107,14 @@ internal object BundledIdeaDecompilationAttempt : IdeaDecompilationAttempt {
         runEngine(inputs, bytes, genericSignatures, true, checkCanceled)
 
     private fun runEngine(inputs: List<Pair<Path, String>>, bytes: List<ByteArray>,
-                          genericSignatures: Boolean, merge: Boolean, checkCanceled: () -> Unit): DecompiledClass {
+                          genericSignatures: Boolean, merge: Boolean, checkCanceled: () -> Unit,
+                          allowParameterRetry: Boolean = true): DecompiledClass {
         val internalName = inputs.first().second
         checkCanceled()
         var source: String? = null
         val warnings = mutableListOf<String>()
         val issues = mutableListOf<DecompilationIssue>()
+        val parameterRetryMethods = mutableMapOf<String, MutableSet<String>>()
         var engineFailure: Throwable? = null
         val saver = object : IResultSaver {
             override fun saveClassFile(path: String?, qualifiedName: String?, entryName: String?, content: String?, mapping: IntArray?) {
@@ -141,6 +143,15 @@ internal object BundledIdeaDecompilationAttempt : IdeaDecompilationAttempt {
                             message.startsWith("Class $candidate ")
                     }?.second
                     issues.add(DecompilationIssue(name, t.javaClass.name, "$message: ${PluginDiagnostics.describe(t)}"))
+                    // Match the actual SSA failure, not arbitrary engine errors or warning text.
+                    if (allowParameterRetry && name != null && t is NullPointerException && t.stackTrace.any {
+                        it.className == "org.jetbrains.java.decompiler.modules.decompiler.sforms.SSAConstructorSparseEx" &&
+                            it.methodName == "processExprent"
+                    }) {
+                        val method = Regex("^Method (\\S+) (\\([^ ]*\\)[^ ]+) in class ").find(message)
+                        if (method != null) parameterRetryMethods.getOrPut(name) { mutableSetOf() }
+                            .add(method.groupValues[1] + method.groupValues[2])
+                    }
                 }
                 writeMessage("$message: ${t.javaClass.name}: ${t.message}", severity)
             }
@@ -179,6 +190,29 @@ internal object BundledIdeaDecompilationAttempt : IdeaDecompilationAttempt {
         }
         finally { org.jetbrains.java.decompiler.main.DecompilerContext.setCurrentContext(null) }
         checkCanceled()
+        if (engineFailure != null && parameterRetryMethods.isNotEmpty()) {
+            try {
+                var changed = false
+                val normalized = bytes.mapIndexed { index, original ->
+                    checkCanceled()
+                    ParameterIncrementNormalizer.normalize(original,
+                        parameterRetryMethods[inputs[index].second].orEmpty(), Runnable { checkCanceled() })
+                        ?.also { changed = true } ?: original
+                }
+                if (changed) {
+                    val recovered = runEngine(inputs, normalized, genericSignatures, merge, checkCanceled, false)
+                    return recovered.copy(warnings = listOf(
+                        "已通过参数自增兼容处理恢复反编译（仍使用 IDEA 内置引擎）；仅改写内存中的等价指令，原始 class/JAR 未修改。"
+                    ) + recovered.warnings)
+                }
+            } catch (e: Exception) {
+                PluginDiagnostics.rethrowCancellation(e)
+                checkCanceled()
+                // Keep the original source and failure attribution if the bounded retry also fails.
+                engineFailure!!.addSuppressed(e)
+                PluginDiagnostics.debug("IDEA parameter-increment compatibility retry failed: class=$internalName", e)
+            }
+        }
         val text = source?.takeIf { it.isNotBlank() }
             ?: throw IOException("IDEA 反编译器没有生成 $internalName 的源码（genericSignatures=$genericSignatures）：${warnings.joinToString()}", engineFailure)
         if (engineFailure != null) throw PartialDecompilationException(DecompiledClass(text, warnings.toList(), issues.toList()), engineFailure!!)
