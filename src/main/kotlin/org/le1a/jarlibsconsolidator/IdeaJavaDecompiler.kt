@@ -1,222 +1,141 @@
 package org.le1a.jarlibsconsolidator
 
-import org.jetbrains.java.decompiler.main.CancellationManager
-import org.jetbrains.java.decompiler.main.decompiler.BaseDecompiler
-import org.jetbrains.java.decompiler.main.extern.IBytecodeProvider
-import org.jetbrains.java.decompiler.main.extern.IFernflowerLogger
-import org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences
-import org.jetbrains.java.decompiler.main.extern.IResultSaver
+import com.intellij.lang.java.lexer.JavaLexer
+import com.intellij.pom.java.LanguageLevel
+import com.intellij.psi.JavaTokenType
+import com.intellij.ide.highlighter.JavaClassFileType
+import com.intellij.ide.util.PropertiesComponent
+import com.intellij.openapi.application.ApplicationManager
+import com.intellij.openapi.progress.ProgressManager
+import com.intellij.openapi.progress.ProcessCanceledException
+import com.intellij.openapi.progress.ProgressIndicator
+import com.intellij.openapi.progress.util.ProgressIndicatorBase
+import com.intellij.openapi.vfs.JarFileSystem
+import com.intellij.openapi.vfs.LocalFileSystem
+import com.intellij.openapi.vfs.VirtualFile
+import com.intellij.psi.compiled.ClassFileDecompilers
 import java.io.IOException
 import java.nio.file.Files
 import java.nio.file.Path
-import java.util.jar.Manifest
+import java.util.concurrent.CancellationException
 
-/** A saver may produce the healthy methods even when Fernflower fails another method. */
-internal class PartialDecompilationException(val partial: DecompiledClass, cause: Throwable) :
-    IOException("IDEA 仅生成部分源码：${partial.issues.joinToString { it.reason }}", cause)
+/** An original loose class or an entry in an original (possibly staged nested) JAR. */
+internal data class ClassSource(val container: Path, val entry: String? = null)
 
-/** Uses the engine supplied by the installed IDEA Java Bytecode Decompiler plugin. */
-internal class IdeaJavaDecompiler(
-    private val cache: DecompilationCache? = sessionCache,
-    private val engine: IdeaDecompilationAttempt = BundledIdeaDecompilationAttempt,
-    override val mergeInnerClasses: Boolean = true
-) : ClassDecompiler {
+internal fun interface NativeIdeaText {
+    fun read(source: ClassSource, selected: Map<ClassSource, Path>, checkCanceled: () -> Unit): String
+}
+
+/** Delegate to the registered editor decompiler, without options, retries, bytecode edits or a source cache. */
+internal class IdeaJavaDecompiler(private val nativeText: NativeIdeaText = EditorIdeaText) : ClassDecompiler {
+    override val mergeInnerClasses = true
+    override val requiresOriginalFiles = true
+    private val sources = mutableMapOf<Path, ClassSource>()
+    private val selected = mutableMapOf<ClassSource, Path>()
+
+    override fun registerSource(snapshot: Path, source: ClassSource) {
+        sources[snapshot] = source
+        selected[source] = snapshot
+    }
+
+    override fun releaseSources() { sources.clear(); selected.clear() }
+
+    override fun decompile(file: Path, internalName: String, checkCanceled: () -> Unit): DecompiledClass =
+        decompileGroup(listOf(file to internalName), checkCanceled)
 
     override fun decompileGroup(inputs: List<Pair<Path, String>>, checkCanceled: () -> Unit): DecompiledClass {
-        if (inputs.size == 1) return decompile(inputs[0].first, inputs[0].second, checkCanceled)
         checkCanceled()
-        val bytes = inputs.map { (path, _) -> checkCanceled(); Files.readAllBytes(path) }
-        // Include every selected member and its name: filter changes and inner-only edits invalidate the cache.
-        val cacheInput = if (bytes.sumOf { it.size.toLong() } <= 16L * 1024 * 1024) {
-            val buffer = java.io.ByteArrayOutputStream()
-            java.io.DataOutputStream(buffer).use { out -> inputs.forEachIndexed { index, (_, name) ->
-                out.writeUTF(name); out.writeInt(bytes[index].size); out.write(bytes[index])
-            } }
-            buffer.toByteArray()
-        } else null
-        val key = cacheInput?.let { cache?.key("family:" + inputs[0].second, it) }
-        if (key != null && cacheInput != null) cache?.get(key, cacheInput)?.let { checkCanceled(); return it }
-        val result = withRetry(inputs[0].second, checkCanceled) { generic ->
-            engine.decompileGroup(inputs, bytes, generic, checkCanceled)
-        }
+        val root = inputs.first()
+        val source = sources[root.first] ?: ClassSource(root.first)
+        // Direct callers select only their supplied files; exports register all accepted originals before scheduling.
+        val allowed = if (sources.isEmpty()) inputs.associate { ClassSource(it.first) to it.first } else selected
+        val text = nativeText.read(source, allowed, checkCanceled)
         checkCanceled()
-        if (key != null && cacheInput != null) cache?.put(key, cacheInput, result)
-        return result
-    }
-
-    override fun decompile(file: Path, internalName: String, checkCanceled: () -> Unit): DecompiledClass {
-        checkCanceled()
-        val bytecode = Files.readAllBytes(file)
-        val key = cache?.key(internalName, bytecode)
-        if (key != null) cache?.get(key, bytecode)?.let { checkCanceled(); return it }
-        val result = withRetry(internalName, checkCanceled) { generic ->
-            engine.decompile(file, internalName, bytecode, generic, checkCanceled)
-        }
-        checkCanceled()
-        // Warning-bearing fallback results are intentionally not cached as clean successes.
-        if (key != null) cache?.put(key, bytecode, result)
-        return result
-    }
-
-    private fun withRetry(name: String, checkCanceled: () -> Unit,
-                          attempt: (Boolean) -> DecompiledClass): DecompiledClass {
-        try { return attempt(true) }
-        catch (first: IOException) {
-            checkCanceled()
-            PluginDiagnostics.debug("Retry IDEA decompiler without generic signatures: class=$name", first)
-            val recovered = try {
-                attempt(false)
-            } catch (second: IOException) {
-                checkCanceled()
-                second.addSuppressed(first)
-                // Prefer the original attempt on ties, preserving its generic type information.
-                val partial = listOfNotNull((first as? PartialDecompilationException)?.partial,
-                    (second as? PartialDecompilationException)?.partial)
-                    .filter { it.source.isNotBlank() && it.issues.isNotEmpty() }
-                    .minByOrNull { it.issues.size } ?: throw second
-                PluginDiagnostics.debug("Both attempts incomplete; retaining partial source: class=$name", second)
-                return partial.copy(source = "// WARNING: Partial decompilation; failed methods are listed in decompilation-failures.csv.\n" + partial.source,
-                    warnings = listOf("两次尝试后仍有方法失败，已保留部分源码；这不是完整成功，失败明细见 decompilation-failures.csv。") + partial.warnings)
-            }
-            return recovered.copy(warnings = listOf(
-                "已关闭泛型签名重建后恢复导出（仍使用 IDEA 内置引擎）；泛型类型信息可能退化为原始类型。首次失败：${first.message}"
-            ) + recovered.warnings)
-        }
-    }
-
-    companion object { private val sessionCache = DecompilationCache() }
-}
-
-/** Separate retry policy from the installed engine so version-specific failures can be replayed. */
-internal fun interface IdeaDecompilationAttempt {
-    fun decompile(file: Path, internalName: String, bytecode: ByteArray,
-                  genericSignatures: Boolean, checkCanceled: () -> Unit): DecompiledClass
-    fun decompileGroup(inputs: List<Pair<Path, String>>, bytes: List<ByteArray>,
-                       genericSignatures: Boolean, checkCanceled: () -> Unit): DecompiledClass =
-        BundledIdeaDecompilationAttempt.decompileGroup(inputs, bytes, genericSignatures, checkCanceled)
-}
-
-internal object BundledIdeaDecompilationAttempt : IdeaDecompilationAttempt {
-    override fun decompile(
-        file: Path, internalName: String, bytecode: ByteArray,
-        genericSignatures: Boolean, checkCanceled: () -> Unit
-    ): DecompiledClass = runEngine(listOf(file to internalName), listOf(bytecode), genericSignatures, false, checkCanceled)
-
-    override fun decompileGroup(inputs: List<Pair<Path, String>>, bytes: List<ByteArray>,
-                                genericSignatures: Boolean, checkCanceled: () -> Unit): DecompiledClass =
-        runEngine(inputs, bytes, genericSignatures, true, checkCanceled)
-
-    private fun runEngine(inputs: List<Pair<Path, String>>, bytes: List<ByteArray>,
-                          genericSignatures: Boolean, merge: Boolean, checkCanceled: () -> Unit,
-                          allowParameterRetry: Boolean = true): DecompiledClass {
-        val internalName = inputs.first().second
-        checkCanceled()
-        var source: String? = null
-        val warnings = mutableListOf<String>()
+        if (text.isBlank()) throw IOException("IDEA 原生反编译入口未返回源码：${root.second}")
+        // IDEA logs method failures but still returns partial source. Keep its text byte-for-byte.
+        // The public editor API does not expose method diagnostics: do not invent exception types or attribution.
         val issues = mutableListOf<DecompilationIssue>()
-        val parameterRetryMethods = mutableMapOf<String, MutableSet<String>>()
-        var engineFailure: Throwable? = null
-        val saver = object : IResultSaver {
-            override fun saveClassFile(path: String?, qualifiedName: String?, entryName: String?, content: String?, mapping: IntArray?) {
-                if (qualifiedName == internalName) source = content
-            }
-            override fun saveFolder(path: String?) {}
-            override fun copyFile(source: String?, path: String?, entryName: String?) {}
-            override fun createArchive(path: String?, archiveName: String?, manifest: Manifest?) {}
-            override fun saveDirEntry(path: String?, archiveName: String?, entryName: String?) {}
-            override fun copyEntry(source: String?, path: String?, archiveName: String?, entry: String?) {}
-            override fun saveClassEntry(path: String?, archiveName: String?, qualifiedName: String?, entryName: String?, content: String?) {}
-            override fun closeArchive(path: String?, archiveName: String?) {}
-        }
-        val logger = object : IFernflowerLogger() {
-            override fun writeMessage(message: String, severity: Severity) {
-                if (severity >= Severity.WARN) warnings.add(message)
-            }
-            override fun writeMessage(message: String, severity: Severity, t: Throwable) {
-                // Fernflower may catch failures (including cancellation) and report them here.
-                if (t is CancellationManager.CanceledException) throw t
-                PluginDiagnostics.rethrowCancellation(t)
-                if (severity >= Severity.WARN && engineFailure == null) engineFailure = t
-                if (severity >= Severity.WARN) {
-                    val name = inputs.firstOrNull { (_, candidate) ->
-                        message.contains(" in class $candidate couldn't be decompiled") ||
-                            message.startsWith("Class $candidate ")
-                    }?.second
-                    issues.add(DecompilationIssue(name, t.javaClass.name, "$message: ${PluginDiagnostics.describe(t)}"))
-                    // Match the actual SSA failure, not arbitrary engine errors or warning text.
-                    if (allowParameterRetry && name != null && t is NullPointerException && t.stackTrace.any {
-                        it.className == "org.jetbrains.java.decompiler.modules.decompiler.sforms.SSAConstructorSparseEx" &&
-                            it.methodName == "processExprent"
-                    }) {
-                        val method = Regex("^Method (\\S+) (\\([^ ]*\\)[^ ]+) in class ").find(message)
-                        if (method != null) parameterRetryMethods.getOrPut(name) { mutableSetOf() }
-                            .add(method.groupValues[1] + method.groupValues[2])
-                    }
-                }
-                writeMessage("$message: ${t.javaClass.name}: ${t.message}", severity)
-            }
-        }
-        val cancellation = object : CancellationManager {
-            override fun checkCanceled() {
-                try { checkCanceled.invoke() } catch (e: RuntimeException) { throw CancellationManager.CanceledException(e) }
-            }
-            override fun startMethod(className: String?, methodName: String?) { checkCanceled() }
-            override fun finishMethod(className: String?, methodName: String?) { checkCanceled() }
-        }
-        val allowed = inputs.mapIndexed { index, (path, _) -> path.toAbsolutePath().normalize() to bytes[index] }.toMap()
-        val provider = IBytecodeProvider { externalPath, internalPath ->
+        val lexer = JavaLexer(LanguageLevel.HIGHEST)
+        lexer.start(text)
+        var line = 1
+        var position = 0
+        while (lexer.tokenType != null) {
             checkCanceled()
-            if (internalPath != null) throw IOException("不允许读取未选择的类：$externalPath")
-            allowed[Path.of(externalPath).toAbsolutePath().normalize()]
-                ?: throw IOException("不允许读取未选择的类：$externalPath")
+            if (lexer.tokenType == JavaTokenType.END_OF_LINE_COMMENT) {
+                val comment = text.substring(lexer.tokenStart, lexer.tokenEnd)
+                if (comment.startsWith("// \$FF:") &&
+                    (comment.contains("Couldn't be decompiled", ignoreCase = true) ||
+                        comment.contains("Limits for ") && comment.contains(" are exceeded."))) {
+                    while (position < lexer.tokenStart) { if (text[position++] == '\n') line++ }
+                    issues.add(DecompilationIssue(root.second, "IDEA.NativePartialSource",
+                        "IDEA 原生源码第 $line 行：$comment；属于该源码文件，具体失败类/方法及异常堆栈见 idea.log。"))
+                }
+            }
+            lexer.advance()
         }
-        val options = mapOf<String, Any>(
-            // Only explicitly selected members of this origin/version enter the context.
-            IFernflowerPreferences.DECOMPILE_INNER to if (merge) "1" else "0",
-            IFernflowerPreferences.DECOMPILE_GENERIC_SIGNATURES to if (genericSignatures) "1" else "0",
-            IFernflowerPreferences.REMOVE_SYNTHETIC to "0",
-            IFernflowerPreferences.NEW_LINE_SEPARATOR to "1",
-            IFernflowerPreferences.INDENT_STRING to "    "
-        )
-        try {
-            val engine = BaseDecompiler(provider, saver, options, logger, cancellation)
-            inputs.forEach { (path, _) -> checkCanceled(); engine.addSource(path.toFile()) }
-            engine.decompileContext()
+        return DecompiledClass(text, issues = issues)
+    }
+}
+
+/** This is the same Light.getText entry called by IDEA for Java class editor text. */
+internal object EditorIdeaText : NativeIdeaText {
+    override fun read(source: ClassSource, selected: Map<ClassSource, Path>, checkCanceled: () -> Unit): String {
+        val app = ApplicationManager.getApplication()
+        check(!app.isDispatchThread && !app.isWriteAccessAllowed) { "反编译必须在后台线程执行" }
+        if (!app.isUnitTestMode && !PropertiesComponent.getInstance().isValueSet("decompiler.legal.notice.accepted")) {
+            throw IOException("请先在 IDEA 中打开任意 Java class，并通过 IDEA 自带的反编译提示后再导出。")
         }
-        catch (e: CancellationManager.CanceledException) { throw (e.cause as? RuntimeException ?: e) }
-        catch (e: Exception) {
-            PluginDiagnostics.rethrowCancellation(e)
-            throw IOException("IDEA 反编译失败: class=$internalName, genericSignatures=$genericSignatures", e)
-        }
-        finally { org.jetbrains.java.decompiler.main.DecompilerContext.setCurrentContext(null) }
         checkCanceled()
-        if (engineFailure != null && parameterRetryMethods.isNotEmpty()) {
-            try {
-                var changed = false
-                val normalized = bytes.mapIndexed { index, original ->
-                    checkCanceled()
-                    ParameterIncrementNormalizer.normalize(original,
-                        parameterRetryMethods[inputs[index].second].orEmpty(), Runnable { checkCanceled() })
-                        ?.also { changed = true } ?: original
-                }
-                if (changed) {
-                    val recovered = runEngine(inputs, normalized, genericSignatures, merge, checkCanceled, false)
-                    return recovered.copy(warnings = listOf(
-                        "已通过参数自增兼容处理恢复反编译（仍使用 IDEA 内置引擎）；仅改写内存中的等价指令，原始 class/JAR 未修改。"
-                    ) + recovered.warnings)
-                }
-            } catch (e: Exception) {
-                PluginDiagnostics.rethrowCancellation(e)
-                checkCanceled()
-                // Keep the original source and failure attribution if the bounded retry also fails.
-                engineFailure!!.addSuppressed(e)
-                PluginDiagnostics.debug("IDEA parameter-increment compatibility retry failed: class=$internalName", e)
+        val file = resolve(source)
+        val prefix = file.nameWithoutExtension + "$"
+        val context = listOf(file) + file.parent.children.filter {
+            it.name.startsWith(prefix) && it.fileType === JavaClassFileType.INSTANCE
+        }
+        // Check the exact siblings the native decompiler will load. Never silently include filtered content.
+        for (member in context) {
+            checkCanceled()
+            val location = if (source.entry == null) ClassSource(Path.of(member.path)) else
+                ClassSource(source.container, source.entry.substringBeforeLast('/', "").let {
+                    if (it.isEmpty()) member.name else "$it/${member.name}"
+                })
+            val snapshot = selected[location] ?: throw IOException(
+                "IDEA 原生反编译会同时读取未选中的类 ${member.name}；已跳过整个源码文件以保持过滤条件，请同时选择该类族。")
+            if (!member.contentsToByteArray().contentEquals(Files.readAllBytes(snapshot))) {
+                throw IOException("扫描后 class 内容已变化或 IDEA 文件缓存尚未刷新，请刷新依赖库后重试：${member.url}")
             }
         }
-        val text = source?.takeIf { it.isNotBlank() }
-            ?: throw IOException("IDEA 反编译器没有生成 $internalName 的源码（genericSignatures=$genericSignatures）：${warnings.joinToString()}", engineFailure)
-        if (engineFailure != null) throw PartialDecompilationException(DecompiledClass(text, warnings.toList(), issues.toList()), engineFailure!!)
-        return DecompiledClass(text, warnings.toList())
+        val native = ClassFileDecompilers.getInstance().find(file, ClassFileDecompilers.Light::class.java)
+        if (native == null || native.javaClass.name != "org.jetbrains.java.decompiler.IdeaDecompiler") {
+            throw IOException("此 class 的编辑器反编译入口不是 IDEA 自带的 Java Bytecode Decompiler，请检查已启用的反编译插件。")
+        }
+        var text: String? = null
+        // Native cancellation uses a thread-local ProgressIndicator. Each worker gets its own indicator.
+        val delegate = ProgressIndicatorBase()
+        val indicator = object : ProgressIndicator by delegate {
+            override fun checkCanceled() {
+                try { checkCanceled.invoke() }
+                catch (e: CancellationException) { throw ProcessCanceledException(e) }
+                delegate.checkCanceled()
+            }
+            override fun isCanceled(): Boolean {
+                try { checkCanceled() } catch (_: ProcessCanceledException) { return true }
+                return delegate.isCanceled
+            }
+        }
+        ProgressManager.getInstance().runProcess(Runnable {
+            indicator.checkCanceled()
+            text = native.getText(file).toString()
+        }, indicator)
+        checkCanceled()
+        return text ?: throw IOException("IDEA 原生反编译没有返回结果：${file.url}")
     }
 
+    internal fun resolve(source: ClassSource): VirtualFile {
+        val local = LocalFileSystem.getInstance().refreshAndFindFileByNioFile(source.container)
+            ?: throw IOException("IDEA 无法读取源文件：${source.container}")
+        local.refresh(false, false)
+        if (source.entry == null) return local
+        return JarFileSystem.getInstance().getJarRootForLocalFile(local)?.findFileByRelativePath(source.entry)
+            ?: throw IOException("IDEA 无法读取 JAR 条目：${source.container}!/${source.entry}")
+    }
 }

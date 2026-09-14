@@ -14,6 +14,9 @@ import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
 
 class ClassExportServiceTest {
+    companion object {
+        @org.junit.BeforeClass @JvmStatic fun startIdea() { com.intellij.testFramework.TestApplicationManager.getInstance() }
+    }
     @get:Rule val temporary = TemporaryFolder()
 
     private fun compile(name: String, source: String): Path {
@@ -142,13 +145,11 @@ class ClassExportServiceTest {
         """.trimIndent()))
         val target = project.resolve("sources.zip")
         val result = ClassExportService.export(project, listOf(project), target, ExportFilter("", "Hidden"), IdeaJavaDecompiler())
-        assertEquals(result.failures.toString(), 1, result.exported)
+        assertEquals(0, result.exported)
         assertEquals(1, result.filtered)
-        val sources = entries(target).filterKeys { it.endsWith(".java") }
-        assertTrue(sources.containsKey("demo/Outer.java"))
-        assertFalse(sources.containsKey("demo/Outer\$Visible.java"))
-        assertTrue(sources.getValue("demo/Outer.java").toString(Charsets.UTF_8).contains("return 7;"))
-        assertFalse(sources.values.any { "SHOULD_NOT_EXPORT" in it.toString(Charsets.UTF_8) })
+        assertEquals(2, result.decompilationFailed)
+        assertFalse(entries(target).keys.any { it.endsWith(".java") })
+        assertTrue(entries(target).getValue("decompilation-failures.csv").toString(Charsets.UTF_8).contains("未选中的类"))
     }
 
     @Test fun `families retain different inner versions even when outer bytes are identical`() {
@@ -161,17 +162,16 @@ class ClassExportServiceTest {
         val second = jar(project.resolve("second.jar"), b)
         val copy = Files.copy(first, project.resolve("copy.jar"))
         val target = project.resolve("sources.zip")
-        val cache = DecompilationCache()
-        val result = ClassExportService.export(project, listOf(first, second, copy), target, ExportFilter(), IdeaJavaDecompiler(cache), parallelism = 2, batchSize = 1)
+        val result = ClassExportService.export(project, listOf(first, second, copy), target, ExportFilter(), IdeaJavaDecompiler(), parallelism = 2, batchSize = 1)
         assertEquals(result.failures.toString(), 2, result.exported)
         val sources = entries(target).filterKeys { it.endsWith(".java") }
         assertTrue(sources.keys.all { it.startsWith("classes-conflicts/") && it.endsWith("demo/Outer.java") })
         assertTrue(sources.values.any { "return 11;" in it.toString(Charsets.UTF_8) })
         assertTrue(sources.values.any { "return 22;" in it.toString(Charsets.UTF_8) })
         // A warm full-family result must not leak an inner class after the filter changes.
-        val filtered = ClassExportService.export(project, listOf(first), target, ExportFilter("", "Inner"), IdeaJavaDecompiler(cache))
-        assertEquals(1, filtered.exported)
-        assertFalse(entries(target).getValue("demo/Outer.java").toString(Charsets.UTF_8).contains("return 11;"))
+        val filtered = ClassExportService.export(project, listOf(first), target, ExportFilter("", "Inner"), IdeaJavaDecompiler())
+        assertEquals(0, filtered.exported)
+        assertFalse(entries(target).keys.any { it.endsWith(".java") })
     }
 
     @Test fun `anonymous and local classes merge and generated outer source recompiles`() {
@@ -185,7 +185,7 @@ class ClassExportServiceTest {
             }
         """.trimIndent())
         val target = project.resolve("sources.zip")
-        val result = ClassExportService.export(project, listOf(classes), target, ExportFilter(), IdeaJavaDecompiler(null))
+        val result = ClassExportService.export(project, listOf(classes), target, ExportFilter(), IdeaJavaDecompiler())
         assertEquals(result.failures.toString(), 1, result.exported)
         assertEquals(0, result.decompilationFailed)
         val source = entries(target).getValue("demo/Outer.java").toString(Charsets.UTF_8)
@@ -206,7 +206,7 @@ class ClassExportServiceTest {
             }
         """.trimIndent())
         val target = project.resolve("sources.zip")
-        val result = ClassExportService.export(project, listOf(classes), target, ExportFilter("Branch"), IdeaJavaDecompiler(null))
+        val result = ClassExportService.export(project, listOf(classes), target, ExportFilter("Branch"), IdeaJavaDecompiler())
         assertEquals(result.failures.toString(), 1, result.exported)
         assertEquals(0, result.decompilationFailed)
         val source = entries(target).getValue("demo/Outer\$Branch.java").toString(Charsets.UTF_8)
@@ -236,7 +236,7 @@ class ClassExportServiceTest {
         val outer = compile("Outer", "package demo; public class Outer {}")
         val separate = compile("Outer\$Standalone", "package demo; public class Outer\$Standalone { public int value() { return 8; } }")
         Files.copy(separate.resolve("demo/Outer\$Standalone.class"), outer.resolve("demo/Outer\$Standalone.class"))
-        val result = ClassExportService.export(project, listOf(outer), project.resolve("sources.zip"), ExportFilter(), IdeaJavaDecompiler(null))
+        val result = ClassExportService.export(project, listOf(outer), project.resolve("sources.zip"), ExportFilter(), IdeaJavaDecompiler())
         assertEquals(result.failures.toString(), 2, result.exported)
     }
 
@@ -246,175 +246,12 @@ class ClassExportServiceTest {
         Files.copy(compiled.resolve("demo/Outer.class"), project.resolve("Outer.class"))
         Files.copy(compiled.resolve("demo/Outer\$Inner.class"), project.resolve("Outer\$Inner.class"))
         val target = project.resolve("sources.zip")
-        val result = ClassExportService.export(project, listOf(project), target, ExportFilter(), IdeaJavaDecompiler(null))
+        val result = ClassExportService.export(project, listOf(project), target, ExportFilter(), IdeaJavaDecompiler())
         assertEquals(result.failures.toString(), 1, result.exported)
         assertEquals(0, result.decompilationFailed)
         val sources = entries(target).filterKeys { it.endsWith(".java") }
         assertEquals(setOf("demo/Outer.java"), sources.keys)
         assertTrue(sources.getValue("demo/Outer.java").toString(Charsets.UTF_8).contains("return 91;"))
-    }
-
-    @Test fun `partial family keeps healthy methods and records only its failed member in CSV`() {
-        val project = temporary.newFolder().toPath()
-        val classes = compile("Outer", "package demo; public class Outer { public static class Inner { public int ok() { return 91; } } }")
-        val calls = java.util.concurrent.atomic.AtomicInteger()
-        val source = "package demo; public class Outer { public int ok() { return 73; } public void broken() { /* Couldn't be decompiled */ } public static class Inner { public int ok() { return 91; } } }"
-        val attempt = object : IdeaDecompilationAttempt {
-            override fun decompile(file: Path, internalName: String, bytecode: ByteArray, genericSignatures: Boolean,
-                                   checkCanceled: () -> Unit): DecompiledClass = error("expected family")
-            override fun decompileGroup(inputs: List<Pair<Path, String>>, bytes: List<ByteArray>, genericSignatures: Boolean,
-                                        checkCanceled: () -> Unit): DecompiledClass {
-                calls.incrementAndGet()
-                val issue = DecompilationIssue("demo/Outer", "java.lang.NullPointerException",
-                    "Method broken ()V in class demo/Outer couldn't be decompiled: vers is null")
-                throw PartialDecompilationException(DecompiledClass(source, issues = listOf(issue)), NullPointerException("vers is null"))
-            }
-        }
-        val cache = DecompilationCache()
-        val target = project.resolve("sources.zip")
-        repeat(2) {
-            val result = ClassExportService.export(project, listOf(classes), target, ExportFilter(), IdeaJavaDecompiler(cache, attempt))
-            assertEquals(1, result.exported)
-            assertEquals(1, result.partiallyExported)
-            assertEquals(1, result.decompilationFailed)
-            val files = entries(target)
-            val java = files.getValue("demo/Outer.java").toString(Charsets.UTF_8)
-            assertTrue(java.startsWith("// WARNING: Partial decompilation"))
-            assertTrue(java.contains("return 73;") && java.contains("return 91;"))
-            val csv = files.getValue("decompilation-failures.csv").toString(Charsets.UTF_8)
-            assertTrue(csv.contains("broken ()V"))
-            assertFalse(csv.contains("demo.Outer\$Inner"))
-            assertTrue(files.getValue("export-report.txt").toString(Charsets.UTF_8).contains("已保留部分源码文件: 1"))
-        }
-        assertEquals("Incomplete source must never enter the clean cache", 4, calls.get())
-    }
-
-    @Test fun `partial first attempt is retained if retry emits no source but cancellation still propagates`() {
-        val classes = compile("One", "package demo; public class One {}")
-        val issue = DecompilationIssue("demo/One", "java.lang.NullPointerException", "method failed")
-        val first = DecompiledClass("class One { void broken() {} }", issues = listOf(issue))
-        val attempt = IdeaDecompilationAttempt { _, _, _, generic, _ ->
-            if (generic) throw PartialDecompilationException(first, NullPointerException("vers"))
-            throw IOException("No source on retry")
-        }
-        val result = IdeaJavaDecompiler(null, attempt).decompile(classes.resolve("demo/One.class"), "demo/One") {}
-        assertEquals(listOf(issue), result.issues)
-        assertTrue(result.source.contains(first.source))
-        val cancel = CancellationException("stop")
-        val cancelAttempt = IdeaDecompilationAttempt { _, _, _, generic, _ ->
-            if (generic) throw PartialDecompilationException(first, NullPointerException("vers"))
-            throw cancel
-        }
-        assertSame(cancel, assertThrows(CancellationException::class.java) {
-            IdeaJavaDecompiler(null, cancelAttempt).decompile(classes.resolve("demo/One.class"), "demo/One") {}
-        })
-    }
-
-    private fun genericInnerFixture(value: Int = 42): Path = compile("GenericOuter", """
-        package demo;
-        import java.util.List;
-        import java.util.concurrent.atomic.AtomicBoolean;
-        public class GenericOuter {
-            public String outerSecret() { return "OUTER_SHOULD_NOT_EXPORT"; }
-            public class Task {
-                private final List<String> names;
-                public Task(String a, String b, String c, AtomicBoolean d, List<String> names, int e, Long f) {
-                    this.names = names;
-                }
-                public int value() { return $value; }
-                public int size() { return names.size(); }
-            }
-            public static class Hidden { public String secret() { return "HIDDEN_SHOULD_NOT_EXPORT"; } }
-        }
-    """.trimIndent())
-
-    // The build baseline (IDEA 2024.1) tolerates this signature. Replay the newer engine's
-    // reported failure, then run the real bundled engine with the actual fallback options.
-    private fun replayGenericFailure(): IdeaDecompilationAttempt = IdeaDecompilationAttempt { file, name, bytes, generic, check ->
-        if (generic) throw IOException("Inconsistent generic signature in method <init>: Index 7 out of bounds for length 7",
-            IndexOutOfBoundsException("Index 7 out of bounds for length 7"))
-        BundledIdeaDecompilationAttempt.decompile(file, name, bytes, generic, check)
-    }
-
-    @Test fun `reported generic failure retries real engine without leaking filtered classes`() {
-        val project = temporary.newFolder().toPath()
-        val classes = genericInnerFixture()
-        val name = "demo/GenericOuter\$Task"
-        val input = classes.resolve("$name.class")
-        val normal = IdeaJavaDecompiler(null).decompile(input, name) {}
-        assertTrue(normal.source, normal.source.contains("return 42;"))
-        val cache = DecompilationCache()
-        val engine = IdeaJavaDecompiler(cache, replayGenericFailure())
-        val result = engine.decompile(input, name) {}
-        assertTrue(result.source, result.source.contains("return 42;"))
-        assertTrue(result.source, result.source.contains("names.size()"))
-        assertTrue(result.warnings.toString(), result.warnings.any { it.contains("关闭泛型签名") })
-        val bytecode = Files.readAllBytes(input)
-        assertNull(cache.get(cache.key(name, bytecode), bytecode))
-        val dependency = jar(project.resolve("generic.jar"), classes)
-        val target = project.resolve("sources.zip")
-        val exported = ClassExportService.export(project, listOf(dependency), target, ExportFilter("Task", "Hidden"), engine)
-        val files = entries(target)
-        assertEquals(1, exported.exported)
-        assertEquals(0, exported.decompilationFailed)
-        assertFalse(files.containsKey("decompilation-failures.csv"))
-        assertEquals(setOf("$name.java"), files.keys.filter { it.endsWith(".java") }.toSet())
-        assertTrue(files.getValue("export-report.txt").toString(Charsets.UTF_8).contains("关闭泛型签名"))
-        assertFalse(files.getValue("$name.java").toString(Charsets.UTF_8).contains("SHOULD_NOT_EXPORT"))
-    }
-
-    @Test fun `parallel generic fallback retains distinct versions of the same inner class`() {
-        val project = temporary.newFolder().toPath()
-        val libraries = listOf(jar(project.resolve("first.jar"), genericInnerFixture(41)),
-            jar(project.resolve("second.jar"), genericInnerFixture(42)))
-        val target = project.resolve("sources.zip")
-        val result = ClassExportService.export(project, libraries, target, ExportFilter("Task"), IdeaJavaDecompiler(null, replayGenericFailure()), parallelism = 2, batchSize = 1)
-        val sources = entries(target).filterKeys { it.endsWith(".java") }
-        assertEquals(result.failures.toString(), 2, result.exported)
-        assertTrue(sources.keys.all { it.startsWith("classes-conflicts/") })
-        assertTrue(sources.values.any { "return 41;" in it.toString(Charsets.UTF_8) })
-        assertTrue(sources.values.any { "return 42;" in it.toString(Charsets.UTF_8) })
-    }
-
-    @Test fun `cancellation inside fallback engine propagates and clears thread context`() {
-        val classes = genericInnerFixture()
-        val name = "demo/GenericOuter\$Task"
-        val canceled = CancellationException("stop fallback")
-        val error = assertThrows(CancellationException::class.java) {
-            IdeaJavaDecompiler(null, replayGenericFailure()).decompile(classes.resolve("$name.class"), name) {
-                if (org.jetbrains.java.decompiler.main.DecompilerContext.getCurrentContext() != null &&
-                    !org.jetbrains.java.decompiler.main.DecompilerContext.getOption(
-                        org.jetbrains.java.decompiler.main.extern.IFernflowerPreferences.DECOMPILE_GENERIC_SIGNATURES)) throw canceled
-            }
-        }
-        assertSame(canceled, error)
-        assertNull(org.jetbrains.java.decompiler.main.DecompilerContext.getCurrentContext())
-    }
-
-    @Test fun `successful generic decompilation uses one attempt and preserves type arguments`() {
-        val classes = compile("Generic", "package demo; public class Generic { public java.util.List<String> names() { return java.util.Collections.emptyList(); } }")
-        var attempts = 0
-        val engine = IdeaDecompilationAttempt { file, name, bytes, generic, check ->
-            attempts++
-            assertTrue(generic)
-            BundledIdeaDecompilationAttempt.decompile(file, name, bytes, generic, check)
-        }
-        val result = IdeaJavaDecompiler(null, engine).decompile(classes.resolve("demo/Generic.class"), "demo/Generic") {}
-        assertEquals(1, attempts)
-        assertTrue(result.source, result.source.contains("List<String>"))
-    }
-
-    @Test fun `both failed attempts retain diagnostic causes and never cache empty source`() {
-        val file = temporary.newFile("Broken.class").toPath()
-        Files.write(file, byteArrayOf(0, 1, 2))
-        val cache = DecompilationCache()
-        val error = assertThrows(IOException::class.java) { IdeaJavaDecompiler(cache).decompile(file, "Broken") {} }
-        assertEquals(1, error.suppressed.size)
-        assertTrue(error.message, error.message!!.contains("genericSignatures=false"))
-        assertTrue(error.suppressed.single().message!!.contains("genericSignatures=true"))
-        val bytes = Files.readAllBytes(file)
-        assertNull(cache.get(cache.key("Broken", bytes), bytes))
-        assertNull(org.jetbrains.java.decompiler.main.DecompilerContext.getCurrentContext())
     }
 
     @Test fun `corrupt class and individual decompile failures are reported without corrupting zip`() {
@@ -532,12 +369,12 @@ class ClassExportServiceTest {
         Files.list(project).use { files -> assertFalse(files.anyMatch { it.fileName.toString().startsWith(".jarlibs-export-") }) }
     }
 
-    @Test fun `cached exports honor changed filters and replaced bytecode`() {
+    @Test fun `native exports honor changed filters and replaced bytecode`() {
         val project = temporary.newFolder().toPath()
         val library = project.resolve("input.jar")
         jar(library, compile("Same", "package demo; public class Same { public int value() { return 1; } }"))
         val target = project.resolve("sources.zip")
-        val decompiler = IdeaJavaDecompiler(DecompilationCache())
+        val decompiler = IdeaJavaDecompiler()
         ClassExportService.export(project, listOf(project), target, ExportFilter(), decompiler)
         assertTrue("return 1;" in entries(target).getValue("demo/Same.java").toString(Charsets.UTF_8))
         val filtered = ClassExportService.export(project, listOf(project), target, ExportFilter("", "Same"), decompiler)
