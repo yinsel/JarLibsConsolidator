@@ -14,8 +14,38 @@ import java.util.jar.Manifest
 /** Uses the engine supplied by the installed IDEA Java Bytecode Decompiler plugin. */
 internal class IdeaJavaDecompiler(
     private val cache: DecompilationCache? = sessionCache,
-    private val engine: IdeaDecompilationAttempt = BundledIdeaDecompilationAttempt
+    private val engine: IdeaDecompilationAttempt = BundledIdeaDecompilationAttempt,
+    override val mergeInnerClasses: Boolean = true
 ) : ClassDecompiler {
+
+    override fun decompileGroup(inputs: List<Pair<Path, String>>, checkCanceled: () -> Unit): DecompiledClass {
+        if (inputs.size == 1) return decompile(inputs[0].first, inputs[0].second, checkCanceled)
+        checkCanceled()
+        val bytes = inputs.map { (path, _) -> checkCanceled(); Files.readAllBytes(path) }
+        // Include every selected member and its name: filter changes and inner-only edits invalidate the cache.
+        val cacheInput = if (bytes.sumOf { it.size.toLong() } <= 16L * 1024 * 1024) {
+            val buffer = java.io.ByteArrayOutputStream()
+            java.io.DataOutputStream(buffer).use { out -> inputs.forEachIndexed { index, (_, name) ->
+                out.writeUTF(name); out.writeInt(bytes[index].size); out.write(bytes[index])
+            } }
+            buffer.toByteArray()
+        } else null
+        val key = cacheInput?.let { cache?.key("family:" + inputs[0].second, it) }
+        if (key != null && cacheInput != null) cache?.get(key, cacheInput)?.let { checkCanceled(); return it }
+        val result = try {
+            engine.decompileGroup(inputs, bytes, true, checkCanceled)
+        } catch (first: IOException) {
+            checkCanceled()
+            PluginDiagnostics.debug("Retry IDEA class family without generic signatures: class=${inputs[0].second}", first)
+            val recovered = try { engine.decompileGroup(inputs, bytes, false, checkCanceled) }
+            catch (second: IOException) { second.addSuppressed(first); throw second }
+            recovered.copy(warnings = listOf("已关闭泛型签名重建后恢复导出；泛型类型信息可能退化为原始类型。首次失败：${first.message}") + recovered.warnings)
+        }
+        checkCanceled()
+        if (key != null && cacheInput != null) cache?.put(key, cacheInput, result)
+        return result
+    }
+
     override fun decompile(file: Path, internalName: String, checkCanceled: () -> Unit): DecompiledClass {
         checkCanceled()
         val bytecode = Files.readAllBytes(file)
@@ -49,13 +79,24 @@ internal class IdeaJavaDecompiler(
 internal fun interface IdeaDecompilationAttempt {
     fun decompile(file: Path, internalName: String, bytecode: ByteArray,
                   genericSignatures: Boolean, checkCanceled: () -> Unit): DecompiledClass
+    fun decompileGroup(inputs: List<Pair<Path, String>>, bytes: List<ByteArray>,
+                       genericSignatures: Boolean, checkCanceled: () -> Unit): DecompiledClass =
+        BundledIdeaDecompilationAttempt.decompileGroup(inputs, bytes, genericSignatures, checkCanceled)
 }
 
 internal object BundledIdeaDecompilationAttempt : IdeaDecompilationAttempt {
     override fun decompile(
         file: Path, internalName: String, bytecode: ByteArray,
         genericSignatures: Boolean, checkCanceled: () -> Unit
-    ): DecompiledClass {
+    ): DecompiledClass = runEngine(listOf(file to internalName), listOf(bytecode), genericSignatures, false, checkCanceled)
+
+    override fun decompileGroup(inputs: List<Pair<Path, String>>, bytes: List<ByteArray>,
+                                genericSignatures: Boolean, checkCanceled: () -> Unit): DecompiledClass =
+        runEngine(inputs, bytes, genericSignatures, true, checkCanceled)
+
+    private fun runEngine(inputs: List<Pair<Path, String>>, bytes: List<ByteArray>,
+                          genericSignatures: Boolean, merge: Boolean, checkCanceled: () -> Unit): DecompiledClass {
+        val internalName = inputs.first().second
         checkCanceled()
         var source: String? = null
         val warnings = mutableListOf<String>()
@@ -91,16 +132,16 @@ internal object BundledIdeaDecompilationAttempt : IdeaDecompilationAttempt {
             override fun startMethod(className: String?, methodName: String?) { checkCanceled() }
             override fun finishMethod(className: String?, methodName: String?) { checkCanceled() }
         }
+        val allowed = inputs.mapIndexed { index, (path, _) -> path.toAbsolutePath().normalize() to bytes[index] }.toMap()
         val provider = IBytecodeProvider { externalPath, internalPath ->
             checkCanceled()
-            if (internalPath != null || Path.of(externalPath).toAbsolutePath().normalize() != file.toAbsolutePath().normalize()) {
-                throw IOException("不允许读取未选择的类：$externalPath")
-            }
-            bytecode
+            if (internalPath != null) throw IOException("不允许读取未选择的类：$externalPath")
+            allowed[Path.of(externalPath).toAbsolutePath().normalize()]
+                ?: throw IOException("不允许读取未选择的类：$externalPath")
         }
         val options = mapOf<String, Any>(
-            // Independent files preserve exact class filters, including blacklisted inner classes.
-            IFernflowerPreferences.DECOMPILE_INNER to "0",
+            // Only explicitly selected members of this origin/version enter the context.
+            IFernflowerPreferences.DECOMPILE_INNER to if (merge) "1" else "0",
             IFernflowerPreferences.DECOMPILE_GENERIC_SIGNATURES to if (genericSignatures) "1" else "0",
             IFernflowerPreferences.REMOVE_SYNTHETIC to "0",
             IFernflowerPreferences.NEW_LINE_SEPARATOR to "1",
@@ -108,7 +149,7 @@ internal object BundledIdeaDecompilationAttempt : IdeaDecompilationAttempt {
         )
         try {
             val engine = BaseDecompiler(provider, saver, options, logger, cancellation)
-            engine.addSource(file.toFile())
+            inputs.forEach { (path, _) -> checkCanceled(); engine.addSource(path.toFile()) }
             engine.decompileContext()
         }
         catch (e: CancellationManager.CanceledException) { throw (e.cause as? RuntimeException ?: e) }
@@ -118,6 +159,7 @@ internal object BundledIdeaDecompilationAttempt : IdeaDecompilationAttempt {
         }
         finally { org.jetbrains.java.decompiler.main.DecompilerContext.setCurrentContext(null) }
         checkCanceled()
+        if (engineFailure != null) throw IOException("IDEA 反编译器未完整生成 $internalName 的源码：${warnings.joinToString()}", engineFailure)
         val text = source?.takeIf { it.isNotBlank() }
             ?: throw IOException("IDEA 反编译器没有生成 $internalName 的源码（genericSignatures=$genericSignatures）：${warnings.joinToString()}", engineFailure)
         return DecompiledClass(text, warnings.toList())

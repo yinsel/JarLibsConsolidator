@@ -131,7 +131,7 @@ class ClassExportServiceTest {
         assertTrue(sources.any { (name, bytes) -> name.startsWith("classes-conflicts/second.jar--") && "return 2;" in bytes.toString(Charsets.UTF_8) })
     }
 
-    @Test fun `inner classes export separately and blacklisted inner content cannot leak`() {
+    @Test fun `inner classes merge into outer source and blacklisted inner content cannot leak`() {
         val project = temporary.newFolder().toPath()
         jar(project.resolve("input.jar"), compile("Outer", """
             package demo;
@@ -142,12 +142,81 @@ class ClassExportServiceTest {
         """.trimIndent()))
         val target = project.resolve("sources.zip")
         val result = ClassExportService.export(project, listOf(project), target, ExportFilter("", "Hidden"), IdeaJavaDecompiler())
-        assertEquals(result.failures.toString(), 2, result.exported)
+        assertEquals(result.failures.toString(), 1, result.exported)
         assertEquals(1, result.filtered)
         val sources = entries(target).filterKeys { it.endsWith(".java") }
         assertTrue(sources.containsKey("demo/Outer.java"))
-        assertTrue(sources.containsKey("demo/Outer\$Visible.java"))
+        assertFalse(sources.containsKey("demo/Outer\$Visible.java"))
+        assertTrue(sources.getValue("demo/Outer.java").toString(Charsets.UTF_8).contains("return 7;"))
         assertFalse(sources.values.any { "SHOULD_NOT_EXPORT" in it.toString(Charsets.UTF_8) })
+    }
+
+    @Test fun `families retain different inner versions even when outer bytes are identical`() {
+        val project = temporary.newFolder().toPath()
+        fun fixture(value: Int) = compile("Outer", "package demo; public class Outer { public static class Inner { public int value() { return $value; } } }")
+        val a = fixture(11)
+        val b = fixture(22)
+        assertArrayEquals(Files.readAllBytes(a.resolve("demo/Outer.class")), Files.readAllBytes(b.resolve("demo/Outer.class")))
+        val first = jar(project.resolve("first.jar"), a)
+        val second = jar(project.resolve("second.jar"), b)
+        val copy = Files.copy(first, project.resolve("copy.jar"))
+        val target = project.resolve("sources.zip")
+        val cache = DecompilationCache()
+        val result = ClassExportService.export(project, listOf(first, second, copy), target, ExportFilter(), IdeaJavaDecompiler(cache), parallelism = 2)
+        assertEquals(result.failures.toString(), 2, result.exported)
+        val sources = entries(target).filterKeys { it.endsWith(".java") }
+        assertTrue(sources.keys.all { it.startsWith("classes-conflicts/") && it.endsWith("demo/Outer.java") })
+        assertTrue(sources.values.any { "return 11;" in it.toString(Charsets.UTF_8) })
+        assertTrue(sources.values.any { "return 22;" in it.toString(Charsets.UTF_8) })
+        // A warm full-family result must not leak an inner class after the filter changes.
+        val filtered = ClassExportService.export(project, listOf(first), target, ExportFilter("", "Inner"), IdeaJavaDecompiler(cache))
+        assertEquals(1, filtered.exported)
+        assertFalse(entries(target).getValue("demo/Outer.java").toString(Charsets.UTF_8).contains("return 11;"))
+    }
+
+    @Test fun `anonymous and local classes merge and generated outer source recompiles`() {
+        val project = temporary.newFolder().toPath()
+        val classes = compile("Outer", """
+            package demo;
+            public class Outer {
+                public Runnable task() { return new Runnable() { public void run() { System.out.println("anonymous-body"); } }; }
+                public int local() { class Local { int value() { return 43; } } return new Local().value(); }
+                public class Member { public int value() { return 44; } }
+            }
+        """.trimIndent())
+        val target = project.resolve("sources.zip")
+        val result = ClassExportService.export(project, listOf(classes), target, ExportFilter(), IdeaJavaDecompiler(null))
+        assertEquals(result.failures.toString(), 1, result.exported)
+        assertEquals(0, result.decompilationFailed)
+        val source = entries(target).getValue("demo/Outer.java").toString(Charsets.UTF_8)
+        assertTrue(source, "anonymous-body" in source && "return 43;" in source && "return 44;" in source)
+        assertTrue(Files.exists(compile("Outer", source).resolve("demo/Outer.class")))
+    }
+
+    @Test fun `failed family writes a CSV row for every selected member`() {
+        val project = temporary.newFolder().toPath()
+        val classes = compile("Outer", "package demo; public class Outer { public static class Inner {} }")
+        val failing = object : ClassDecompiler {
+            override val mergeInnerClasses = true
+            override fun decompile(file: Path, internalName: String, checkCanceled: () -> Unit): DecompiledClass = throw IOException("failed")
+            override fun decompileGroup(inputs: List<Pair<Path, String>>, checkCanceled: () -> Unit): DecompiledClass = throw IOException("family failed")
+        }
+        val target = project.resolve("sources.zip")
+        val result = ClassExportService.export(project, listOf(classes), target, ExportFilter(), failing)
+        assertEquals(0, result.exported)
+        assertEquals(2, result.decompilationFailed)
+        val csv = entries(target).getValue("decompilation-failures.csv").toString(Charsets.UTF_8)
+        assertTrue(csv, csv.contains("demo.Outer\$Inner") && csv.contains("demo.Outer"))
+        assertEquals(2, csv.lineSequence().count { it.contains("family failed") })
+    }
+
+    @Test fun `dollar in a top level class name does not cause accidental merging`() {
+        val project = temporary.newFolder().toPath()
+        val outer = compile("Outer", "package demo; public class Outer {}")
+        val separate = compile("Outer\$Standalone", "package demo; public class Outer\$Standalone { public int value() { return 8; } }")
+        Files.copy(separate.resolve("demo/Outer\$Standalone.class"), outer.resolve("demo/Outer\$Standalone.class"))
+        val result = ClassExportService.export(project, listOf(outer), project.resolve("sources.zip"), ExportFilter(), IdeaJavaDecompiler(null))
+        assertEquals(result.failures.toString(), 2, result.exported)
     }
 
     private fun genericInnerFixture(value: Int = 42): Path = compile("GenericOuter", """

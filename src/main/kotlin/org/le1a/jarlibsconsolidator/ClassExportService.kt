@@ -16,6 +16,11 @@ import java.util.zip.ZipOutputStream
 internal data class DecompiledClass(val source: String, val warnings: List<String> = emptyList())
 internal fun interface ClassDecompiler {
     fun decompile(file: Path, internalName: String, checkCanceled: () -> Unit): DecompiledClass
+    val mergeInnerClasses: Boolean get() = false
+    fun decompileGroup(inputs: List<Pair<Path, String>>, checkCanceled: () -> Unit): DecompiledClass {
+        require(inputs.size == 1)
+        return decompile(inputs[0].first, inputs[0].second, checkCanceled)
+    }
 }
 
 /** IO-only export pipeline, separate from IntelliJ's UI and library discovery. */
@@ -24,6 +29,7 @@ internal object ClassExportService {
                       val failures: List<String>, val decompilationFailed: Int = 0)
     private data class DecompilationFailure(val item: Item, val entryName: String, val errorType: String, val reason: String)
     private data class Item(val name: String, val file: Path, val origin: String, val group: String, val digest: String)
+    private data class UnitOfWork(val members: List<Item>, val digest: String) { val root get() = members.first() }
 
     fun export(
         project: Path,
@@ -79,6 +85,10 @@ internal object ClassExportService {
                 val existing = versions.getOrPut(name) { mutableListOf() }
                 if (existing.any { it.digest == digest && Files.mismatch(it.file, staged) == -1L }) {
                     duplicates++
+                    if (decompiler?.mergeInnerClasses == true) {
+                        val shared = existing.first { it.digest == digest && Files.mismatch(it.file, staged) == -1L }
+                        items.add(Item(name, shared.file, origin, group, digest))
+                    }
                     Files.delete(staged)
                 } else {
                     Item(name, staged, origin, group, digest).also { existing.add(it); items.add(it) }
@@ -170,19 +180,22 @@ internal object ClassExportService {
             archive = Files.createTempFile(destination.parent, ".jarlibs-export-", ".zip")
             val report = mutableListOf("zip_entry\tsource")
             val usedEntries = mutableSetOf<String>()
-            val ordered = items.sortedWith(compareBy<Item> { it.name }.thenBy { it.origin })
+            val ordered = exportUnits(items, decompiler?.mergeInnerClasses == true, checkCanceled)
+            val outputVersions = ordered.groupingBy { it.root.name }.eachCount()
             val processing = decompiler?.let {
-                OrderedParallelDecompiler(ordered.map { item -> item.file to item.name }, it, parallelism, checkCanceled)
+                OrderedParallelDecompiler(ordered.map { unit -> unit.root.file to unit.root.name }, it, parallelism,
+                    checkCanceled, ordered.map { unit -> unit.members.map { it.file to it.name } })
             }
             processing.use {
                 ZipOutputStream(Files.newOutputStream(archive)).use { zip ->
-                    for ((index, item) in ordered.withIndex()) {
+                    for ((index, unit) in ordered.withIndex()) {
+                        val item = unit.root
                         checkCanceled()
-                        progress(if (decompiler == null) "打包：${item.name}" else "反编译：${item.name}", 0.3 + 0.65 * index / items.size.coerceAtLeast(1))
+                        progress(if (decompiler == null) "打包：${item.name}" else "反编译：${item.name}", 0.3 + 0.65 * index / ordered.size.coerceAtLeast(1))
                         val extension = if (decompiler == null) "class" else "java"
-                        val prefix = if (versions.getValue(item.name).size == 1) "" else {
+                        val prefix = if (outputVersions.getValue(item.name) == 1) "" else {
                             val label = item.group.replace(Regex("[^\\p{L}\\p{N}._-]"), "_").take(50).ifEmpty { "project" }
-                            "classes-conflicts/$label--${item.digest.take(16)}/"
+                            "classes-conflicts/$label--${unit.digest.take(16)}/"
                         }
                         val entryName = "$prefix${item.name}.$extension"
                         val source = try {
@@ -192,7 +205,9 @@ internal object ClassExportService {
                             }?.source
                         } catch (e: Exception) {
                             val reason = failure(item.origin, e) // Cancellation propagates before being counted.
-                            decompilationFailures.add(DecompilationFailure(item, entryName, e.javaClass.name, reason))
+                            unit.members.forEach { member ->
+                                decompilationFailures.add(DecompilationFailure(member, entryName, e.javaClass.name, reason))
+                            }
                             continue
                         }
                         checkCanceled()
@@ -211,10 +226,10 @@ internal object ClassExportService {
                         } else zip.write(source.toByteArray(Charsets.UTF_8))
                         zip.closeEntry()
                         exported++
-                        report.add("${tsv(entryName)}\t${tsv(item.origin)}")
+                        unit.members.forEach { report.add("${tsv(entryName)}\t${tsv(it.origin)}") }
                     }
                     val summary = "扫描 class: $discovered\n已过滤: $filtered\n相同内容去重: $duplicates\n已导出文件: $exported\n失败/警告: ${failures.size}\n" +
-                            (if (decompiler == null) "" else "反编译失败: ${decompilationFailures.size}\n反编译引擎：IDEA 内置 Fernflower；内部类单独导出。\n") +
+                            (if (decompiler == null) "" else "反编译失败: ${decompilationFailures.size}\n反编译引擎：IDEA 内置 Fernflower；同一来源且命中过滤的内部类合并导出，缺少选中的外部类时单独导出。\n") +
                             failures.joinToString("\n")
                     if (decompilationFailures.isNotEmpty()) {
                         zip.putNextEntry(ZipEntry("decompilation-failures.csv"))
@@ -246,6 +261,49 @@ internal object ClassExportService {
         } finally {
             archive?.let { Files.deleteIfExists(it) }
             work.toFile().deleteRecursively()
+        }
+    }
+
+    private fun exportUnits(items: List<Item>, merge: Boolean, checkCanceled: () -> Unit): List<UnitOfWork> {
+        if (!merge) return items.sortedWith(compareBy<Item> { it.name }.thenBy { it.origin })
+            .map { UnitOfWork(listOf(it), it.digest) }
+        val units = mutableListOf<UnitOfWork>()
+        val parents = mutableMapOf<Path, String?>()
+        // The containing directory/JAR entry directory isolates multi-release and shaded copies too.
+        for (scope in items.groupBy { it.origin.substringBeforeLast('/') }.values) {
+            val byName = scope.groupBy { it.name }
+            val buckets = linkedMapOf<Item, MutableList<Item>>()
+            for (item in scope) {
+                checkCanceled()
+                var root = item
+                val visited = mutableSetOf(root.name)
+                while (true) {
+                    val parent = parents.getOrPut(root.file) {
+                        try { ClassNesting.parent(root.file) }
+                        catch (e: IOException) { null } // The actual engine will report malformed bytecode.
+                    } ?: break
+                    val next = byName[parent]?.singleOrNull() ?: break
+                    if (!visited.add(next.name)) break
+                    root = next
+                }
+                buckets.getOrPut(root) { mutableListOf() }.add(item)
+            }
+            for ((root, members) in buckets) {
+                val sorted = listOf(root) + members.filter { it !== root }.sortedBy { it.name }
+                val hash = java.security.MessageDigest.getInstance("SHA-256")
+                sorted.forEach { hash.update((it.name + ":" + it.digest + "\n").toByteArray(Charsets.UTF_8)) }
+                units.add(UnitOfWork(sorted, if (sorted.size == 1) root.digest else java.util.HexFormat.of().formatHex(hash.digest())))
+            }
+        }
+        // Deduplicate whole families: identical outer bytes can have different inner implementations.
+        val seen = mutableMapOf<Pair<String, String>, MutableList<UnitOfWork>>()
+        return units.sortedWith(compareBy<UnitOfWork> { it.root.name }.thenBy { it.root.origin }).filter { unit ->
+            checkCanceled()
+            val previous = seen.getOrPut(unit.root.name to unit.digest) { mutableListOf() }
+            val duplicate = previous.any { old -> old.members.size == unit.members.size &&
+                old.members.zip(unit.members).all { (a, b) -> a.name == b.name && Files.mismatch(a.file, b.file) == -1L } }
+            if (!duplicate) previous.add(unit)
+            !duplicate
         }
     }
 
