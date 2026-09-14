@@ -96,6 +96,52 @@ jobs:
           path: build/decompiler-kit.tar.gz
           if-no-files-found: error
 
+  cleanup-merged-branches:
+    # One-time, explicit consolidation marker; ordinary main pushes never delete branches.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, '[consolidate-branches]')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Delete the consolidated feature and fix branches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          branches=(
+            feat/class-file-libraries
+            feat/export-class-java-zip
+            fix/decompiler-generic-fallback
+            fix/exception-debug-logging
+            fix/existing-class-target
+            fix/ide-262-manual-release
+            fix/merge-class-roots
+          )
+          for branch in "${branches[@]}"; do
+            ref="refs/remotes/origin/$branch"
+            if ! git show-ref --verify --quiet "$ref"; then continue; fi
+            expected=$(git rev-parse "$ref")
+            git merge-base --is-ancestor "$expected" HEAD || {
+              echo "::error::Unmerged branch retained: $branch"
+              exit 1
+            }
+            current=$(gh api "repos/$GH_REPO/git/ref/heads/$branch" --jq '.object.sha')
+            if [[ "$current" != "$expected" ]]; then
+              echo "::error::Branch changed during cleanup; retained: $branch"
+              exit 1
+            fi
+            gh api --method DELETE "repos/$GH_REPO/git/refs/heads/$branch"
+            echo "Deleted merged branch: $branch ($expected)"
+          done
+
   release:
     if: github.event_name == 'workflow_dispatch'
     needs: build

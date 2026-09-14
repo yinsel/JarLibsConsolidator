@@ -278,10 +278,9 @@ internal object ClassExportService {
                 var root = item
                 val visited = mutableSetOf(root.name)
                 while (true) {
-                    val parent = parents.getOrPut(root.file) {
-                        try { ClassNesting.parent(root.file) }
+                    if (!parents.containsKey(root.file)) parents[root.file] = try { ClassNesting.parent(root.file) }
                         catch (e: IOException) { null } // The actual engine will report malformed bytecode.
-                    } ?: break
+                    val parent = parents[root.file] ?: break
                     val next = byName[parent]?.singleOrNull() ?: break
                     if (!visited.add(next.name)) break
                     root = next

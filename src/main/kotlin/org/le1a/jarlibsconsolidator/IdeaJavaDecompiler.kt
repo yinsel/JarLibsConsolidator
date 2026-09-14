@@ -159,7 +159,7 @@ internal object BundledIdeaDecompilationAttempt : IdeaDecompilationAttempt {
         }
         finally { org.jetbrains.java.decompiler.main.DecompilerContext.setCurrentContext(null) }
         checkCanceled()
-        if (engineFailure != null) throw IOException("IDEA 反编译器未完整生成 $internalName 的源码：${warnings.joinToString()}", engineFailure)
+        if (engineFailure != null) throw IOException("IDEA 反编译器未完整生成 $internalName 的源码（genericSignatures=$genericSignatures）：${warnings.joinToString()}", engineFailure)
         val text = source?.takeIf { it.isNotBlank() }
             ?: throw IOException("IDEA 反编译器没有生成 $internalName 的源码（genericSignatures=$genericSignatures）：${warnings.joinToString()}", engineFailure)
         return DecompiledClass(text, warnings.toList())
