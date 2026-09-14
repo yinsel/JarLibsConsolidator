@@ -12,6 +12,18 @@ for root in roots:
     if candidates:
         shutil.copyfile(candidates[0], out / 'kotlin-stdlib.jar')
         break
+# Use the same public ASM classes as the installed IDEA platform in local plugin probes.
+for root in roots:
+    found = False
+    for source in root.glob('**/util-8.jar'):
+        with zipfile.ZipFile(source) as archive:
+            if 'org/jetbrains/org/objectweb/asm/ClassReader.class' not in archive.namelist():
+                continue
+        shutil.copyfile(source, out / 'idea-asm.jar')
+        found = True
+        break
+    if found:
+        break
 for root in roots:
     for folder, _, names in os.walk(root):
         for name in names:
