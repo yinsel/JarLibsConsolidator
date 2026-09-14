@@ -10,7 +10,6 @@ import java.nio.file.Path
 import java.util.concurrent.CancellationException
 import java.util.concurrent.TimeUnit
 import java.util.zip.ZipEntry
-import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
 
 class ClassExportServiceTest {
@@ -43,7 +42,7 @@ class ClassExportServiceTest {
         return target
     }
 
-    private fun entries(zip: Path): Map<String, ByteArray> = ZipFile(zip.toFile()).use { archive ->
+    private fun entries(zip: Path): Map<String, ByteArray> = DirectoryOutput(zip.toFile()).use { archive ->
         archive.entries().asSequence().associate { it.name to archive.getInputStream(it).use { input -> input.readBytes() } }
     }
 
@@ -53,7 +52,7 @@ class ClassExportServiceTest {
         val loose = Files.createDirectories(project.resolve("target/classes/demo")).resolve("Local.class")
         Files.copy(output.resolve("demo/Local.class"), loose)
         val dependency = jar(temporary.newFolder().toPath().resolve("dependency.jar"), compile("Service", "package org.exampletools; public class Service {}"))
-        val target = project.resolve("classes.zip")
+        val target = project.resolve("classes")
         val result = ClassExportService.export(project, listOf(project.resolve("target/classes"), dependency, dependency), target, ExportFilter())
         val contents = entries(target)
         assertEquals(2, result.exported)
@@ -69,7 +68,7 @@ class ClassExportServiceTest {
         val denied = compile("Secret", "package org.exampletools.internal; public class Secret {}")
         jar(project.resolve("allowed.jar"), allowed)
         jar(project.resolve("denied.jar"), denied)
-        val target = project.resolve("export.zip")
+        val target = project.resolve("export")
         val result = ClassExportService.export(project, listOf(project), target, ExportFilter("*example", "internal"))
         assertEquals(1, result.filtered)
         assertEquals(1, result.exported)
@@ -85,7 +84,7 @@ class ClassExportServiceTest {
             zip.putNextEntry(ZipEntry("BOOT-INF/lib/nested.jar")); Files.copy(nested, zip); zip.closeEntry()
             zip.putNextEntry(ZipEntry("../../escaped.class")); Files.copy(classes.resolve("demo/Safe.class"), zip); zip.closeEntry()
         }
-        val target = project.resolve("export.zip")
+        val target = project.resolve("export")
         val result = ClassExportService.export(project, listOf(project), target, ExportFilter())
         assertEquals(1, result.exported)
         assertEquals(1, result.duplicates)
@@ -99,7 +98,7 @@ class ClassExportServiceTest {
         val a = jar(project.resolve("a.jar"), compile("Same", "package demo; public class Same { public int value() { return 1; } }"))
         jar(project.resolve("b.jar"), compile("Same", "package demo; public class Same { public int value() { return 2; } }"))
         Files.copy(a, project.resolve("copy.jar"))
-        val target = project.resolve("export.zip")
+        val target = project.resolve("export")
         val result = ClassExportService.export(project, listOf(project), target, ExportFilter())
         assertEquals(2, result.exported)
         assertEquals(1, result.duplicates)
@@ -111,7 +110,7 @@ class ClassExportServiceTest {
     @Test fun `IDEA bundled decompiler emits method bodies from jar bytecode`() {
         val project = temporary.newFolder().toPath()
         jar(project.resolve("input.jar"), compile("Answer", "package demo; public class Answer { public static int answer() { return 42; } }"))
-        val target = project.resolve("sources.zip")
+        val target = project.resolve("sources")
         val result = ClassExportService.export(project, listOf(project), target, ExportFilter(), IdeaJavaDecompiler())
         assertEquals(result.failures.toString(), 1, result.exported)
         val source = entries(target).getValue("demo/Answer.java").toString(Charsets.UTF_8)
@@ -125,7 +124,7 @@ class ClassExportServiceTest {
         val project = temporary.newFolder().toPath()
         val first = jar(project.resolve("first.jar"), compile("Same", "package demo; public class Same { public int value() { return 1; } }"))
         jar(project.resolve("second.jar"), compile("Same", "package demo; public class Same { public int value() { return 2; } }"))
-        val target = project.resolve("sources.zip")
+        val target = project.resolve("sources")
         val result = ClassExportService.export(project, listOf(first, project.resolve("second.jar")), target, ExportFilter(), IdeaJavaDecompiler())
         assertEquals(result.failures.toString(), 2, result.exported)
         val sources = entries(target).filterKeys { it.endsWith(".java") }
@@ -143,7 +142,7 @@ class ClassExportServiceTest {
                 public static class Hidden { public String secret() { return "SHOULD_NOT_EXPORT"; } }
             }
         """.trimIndent()))
-        val target = project.resolve("sources.zip")
+        val target = project.resolve("sources")
         val result = ClassExportService.export(project, listOf(project), target, ExportFilter("", "Hidden"), IdeaJavaDecompiler())
         assertEquals(0, result.exported)
         assertEquals(1, result.filtered)
@@ -161,7 +160,7 @@ class ClassExportServiceTest {
         val first = jar(project.resolve("first.jar"), a)
         val second = jar(project.resolve("second.jar"), b)
         val copy = Files.copy(first, project.resolve("copy.jar"))
-        val target = project.resolve("sources.zip")
+        val target = project.resolve("sources")
         val result = ClassExportService.export(project, listOf(first, second, copy), target, ExportFilter(), IdeaJavaDecompiler(), parallelism = 2, batchSize = 1)
         assertEquals(result.failures.toString(), 2, result.exported)
         val sources = entries(target).filterKeys { it.endsWith(".java") }
@@ -169,6 +168,7 @@ class ClassExportServiceTest {
         assertTrue(sources.values.any { "return 11;" in it.toString(Charsets.UTF_8) })
         assertTrue(sources.values.any { "return 22;" in it.toString(Charsets.UTF_8) })
         // A warm full-family result must not leak an inner class after the filter changes.
+        target.toFile().deleteRecursively()
         val filtered = ClassExportService.export(project, listOf(first), target, ExportFilter("", "Inner"), IdeaJavaDecompiler())
         assertEquals(0, filtered.exported)
         assertFalse(entries(target).keys.any { it.endsWith(".java") })
@@ -184,7 +184,7 @@ class ClassExportServiceTest {
                 public class Member { public int value() { return 44; } }
             }
         """.trimIndent())
-        val target = project.resolve("sources.zip")
+        val target = project.resolve("sources")
         val result = ClassExportService.export(project, listOf(classes), target, ExportFilter(), IdeaJavaDecompiler())
         assertEquals(result.failures.toString(), 1, result.exported)
         assertEquals(0, result.decompilationFailed)
@@ -205,7 +205,7 @@ class ClassExportServiceTest {
                 }
             }
         """.trimIndent())
-        val target = project.resolve("sources.zip")
+        val target = project.resolve("sources")
         val result = ClassExportService.export(project, listOf(classes), target, ExportFilter("Branch"), IdeaJavaDecompiler())
         assertEquals(result.failures.toString(), 1, result.exported)
         assertEquals(0, result.decompilationFailed)
@@ -222,7 +222,7 @@ class ClassExportServiceTest {
             override fun decompile(file: Path, internalName: String, checkCanceled: () -> Unit): DecompiledClass = throw IOException("failed")
             override fun decompileGroup(inputs: List<Pair<Path, String>>, checkCanceled: () -> Unit): DecompiledClass = throw IOException("family failed")
         }
-        val target = project.resolve("sources.zip")
+        val target = project.resolve("sources")
         val result = ClassExportService.export(project, listOf(classes), target, ExportFilter(), failing)
         assertEquals(0, result.exported)
         assertEquals(2, result.decompilationFailed)
@@ -236,7 +236,7 @@ class ClassExportServiceTest {
         val outer = compile("Outer", "package demo; public class Outer {}")
         val separate = compile("Outer\$Standalone", "package demo; public class Outer\$Standalone { public int value() { return 8; } }")
         Files.copy(separate.resolve("demo/Outer\$Standalone.class"), outer.resolve("demo/Outer\$Standalone.class"))
-        val result = ClassExportService.export(project, listOf(outer), project.resolve("sources.zip"), ExportFilter(), IdeaJavaDecompiler())
+        val result = ClassExportService.export(project, listOf(outer), project.resolve("sources"), ExportFilter(), IdeaJavaDecompiler())
         assertEquals(result.failures.toString(), 2, result.exported)
     }
 
@@ -245,7 +245,7 @@ class ClassExportServiceTest {
         val compiled = compile("Outer", "package demo; public class Outer { public static class Inner { public int value() { return 91; } } }")
         Files.copy(compiled.resolve("demo/Outer.class"), project.resolve("Outer.class"))
         Files.copy(compiled.resolve("demo/Outer\$Inner.class"), project.resolve("Outer\$Inner.class"))
-        val target = project.resolve("sources.zip")
+        val target = project.resolve("sources")
         val result = ClassExportService.export(project, listOf(project), target, ExportFilter(), IdeaJavaDecompiler())
         assertEquals(result.failures.toString(), 1, result.exported)
         assertEquals(0, result.decompilationFailed)
@@ -263,7 +263,7 @@ class ClassExportServiceTest {
             if (name.endsWith("Bad")) throw IOException("test decompilation failure")
             DecompiledClass("package demo; public class Good {}")
         }
-        val target = project.resolve("sources.zip")
+        val target = project.resolve("sources")
         val result = ClassExportService.export(project, listOf(project), target, ExportFilter(), decompiler)
         assertEquals(1, result.exported)
         assertEquals(2, result.failures.size)
@@ -276,7 +276,7 @@ class ClassExportServiceTest {
         val good = jar(project.resolve("good.jar"), compile("Good", "package demo; public class Good {}"))
         val bad = jar(project.resolve("=bad,quoted.jar"), compile("Bad", "package demo; public class Bad {}"))
         val corrupt = Files.writeString(project.resolve("broken.class"), "invalid bytecode")
-        val target = project.resolve("export.zip")
+        val target = project.resolve("export")
         val engine = ClassDecompiler { _, name, _ ->
             if (name.endsWith("Bad")) throw IOException("失败, \"引号\"\n第二行", IllegalStateException("root cause"))
             DecompiledClass("package demo; public class Good {}", listOf("warning only"))
@@ -296,6 +296,7 @@ class ClassExportServiceTest {
         assertFalse(text.contains("broken.class"))
         assertTrue(files.getValue("export-report.txt").toString(Charsets.UTF_8).contains("反编译失败: 1"))
         // CLASS export never creates a decompilation-failure report, even with scan failures.
+        target.toFile().deleteRecursively()
         val classResult = ClassExportService.export(project, listOf(good, corrupt), target, ExportFilter())
         assertEquals(0, classResult.decompilationFailed)
         assertFalse(entries(target).containsKey("decompilation-failures.csv"))
@@ -305,7 +306,7 @@ class ClassExportServiceTest {
         val project = temporary.newFolder().toPath()
         val libraries = listOf(jar(project.resolve("a.jar"), compile("Same", "public class Same { public int n() { return 1; } }")),
             jar(project.resolve("b.jar"), compile("Same", "public class Same { public int n() { return 2; } }")))
-        val target = project.resolve("export.zip")
+        val target = project.resolve("export")
         val result = ClassExportService.export(project, libraries, target, ExportFilter(),
             ClassDecompiler { _, _, _ -> throw IOException("failed") }, parallelism = 2, batchSize = 1)
         assertEquals(2, result.decompilationFailed)
@@ -319,35 +320,33 @@ class ClassExportServiceTest {
     @Test fun `wrapped IDEA cancellation aborts export and preserves destination`() {
         val project = temporary.newFolder().toPath()
         val dependency = jar(project.resolve("dependency.jar"), compile("Example", "public class Example {}"))
-        val target = Files.writeString(project.resolve("export.zip"), "existing destination")
+        val target = project.resolve("export")
         val canceled = com.intellij.openapi.progress.ProcessCanceledException()
         val decompiler = ClassDecompiler { _, _, _ -> throw IOException("engine wrapper", canceled) }
         val error = assertThrows(com.intellij.openapi.progress.ProcessCanceledException::class.java) {
             ClassExportService.export(project, listOf(dependency), target, ExportFilter(), decompiler)
         }
         assertSame(canceled, error)
-        assertEquals("existing destination", Files.readString(target))
+        assertTrue(Files.readString(target.resolve("export-report.txt")).contains("导出未完成"))
         Files.list(project).use { paths -> assertFalse(paths.anyMatch { it.fileName.toString().startsWith(".jarlibs-export-") }) }
     }
 
-    @Test fun `cancellation preserves existing destination and cleans partial zip`() {
+    @Test fun `cancellation preserves status report and cleans partial files`() {
         val project = temporary.newFolder().toPath()
         jar(project.resolve("a.jar"), compile("Good", "package demo; public class Good {}"))
-        val target = project.resolve("sources.zip")
-        Files.writeString(target, "original")
+        val target = project.resolve("sources")
         assertThrows(CancellationException::class.java) {
             ClassExportService.export(project, listOf(project), target, ExportFilter(),
                 ClassDecompiler { _, _, _ -> throw CancellationException() })
         }
-        assertEquals("original", Files.readString(target))
+        assertTrue(Files.readString(target.resolve("export-report.txt")).contains("导出未完成"))
         Files.list(project).use { files -> assertFalse(files.anyMatch { it.fileName.toString().startsWith(".jarlibs-export-") }) }
     }
 
     @Test fun `parallel cancellation preserves destination and joins decompiler workers`() {
         val project = temporary.newFolder().toPath()
         jar(project.resolve("a.jar"), compile("Outer", "package demo; public class Outer { public static class Inner {} }"))
-        val target = project.resolve("sources.zip")
-        Files.writeString(target, "original")
+        val target = project.resolve("sources")
         val started = java.util.concurrent.CountDownLatch(2)
         val active = java.util.concurrent.atomic.AtomicInteger()
         val cancel = java.util.concurrent.atomic.AtomicBoolean()
@@ -365,7 +364,7 @@ class ClassExportServiceTest {
                 checkCanceled = { if (cancel.get()) throw CancellationException() }, parallelism = 2, batchSize = 1)
         }
         assertEquals(0, active.get())
-        assertEquals("original", Files.readString(target))
+        assertTrue(Files.readString(target.resolve("export-report.txt")).contains("导出未完成"))
         Files.list(project).use { files -> assertFalse(files.anyMatch { it.fileName.toString().startsWith(".jarlibs-export-") }) }
     }
 
@@ -373,13 +372,15 @@ class ClassExportServiceTest {
         val project = temporary.newFolder().toPath()
         val library = project.resolve("input.jar")
         jar(library, compile("Same", "package demo; public class Same { public int value() { return 1; } }"))
-        val target = project.resolve("sources.zip")
+        val target = project.resolve("sources")
         val decompiler = IdeaJavaDecompiler()
         ClassExportService.export(project, listOf(project), target, ExportFilter(), decompiler)
         assertTrue("return 1;" in entries(target).getValue("demo/Same.java").toString(Charsets.UTF_8))
+        target.toFile().deleteRecursively()
         val filtered = ClassExportService.export(project, listOf(project), target, ExportFilter("", "Same"), decompiler)
         assertEquals(0, filtered.exported)
         assertFalse(entries(target).keys.any { it.endsWith(".java") })
+        target.toFile().deleteRecursively()
         jar(library, compile("Same", "package demo; public class Same { public int value() { return 2; } }"))
         ClassExportService.export(project, listOf(project), target, ExportFilter(), decompiler)
         assertTrue("return 2;" in entries(target).getValue("demo/Same.java").toString(Charsets.UTF_8))
@@ -391,17 +392,18 @@ class ClassExportServiceTest {
         jar(project.resolve("unregistered.jar"), compile("Unwanted", "package demo; public class Unwanted {}"))
         val loose = compile("Loose", "package demo; public class Loose {}")
         Files.copy(loose.resolve("demo/Loose.class"), project.resolve("Loose.class"))
-        val output = project.resolve("export.zip")
+        val output = project.resolve("export")
         val result = ClassExportService.export(project, listOf(registered), output, ExportFilter("demo.*"))
         assertEquals(1, result.discovered)
         assertEquals(setOf("demo/Wanted.class"), entries(output).keys.filter { it.endsWith(".class") }.toSet())
+        output.toFile().deleteRecursively()
         ClassExportService.export(project, listOf(registered), output, ExportFilter("demo.*"), IdeaJavaDecompiler())
         assertEquals(setOf("demo/Wanted.java"), entries(output).keys.filter { it.endsWith(".java") }.toSet())
     }
 
     @Test fun `missing library configuration asks user to add dependencies and preserves target`() {
         val project = temporary.newFolder().toPath()
-        val output = project.resolve("export.zip")
+        val output = project.resolve("export")
         Files.writeString(output, "original")
         val error = assertThrows(IllegalArgumentException::class.java) {
             ClassExportService.export(project, emptyList(), output, ExportFilter())
@@ -409,4 +411,33 @@ class ClassExportServiceTest {
         assertTrue(error.message!!.contains("一键添加依赖"))
         assertEquals("original", Files.readString(output))
     }
+    @Test fun `case only class names retain separate portable output paths`() {
+        val project = temporary.newFolder().toPath()
+        val one = jar(project.resolve("first.jar"), compile("Same", "package demo; public class Same {}"))
+        val two = jar(project.resolve("second.jar"), compile("same", "package demo; public class same {}"))
+        val target = project.resolve("classes")
+        val result = ClassExportService.export(project, listOf(one, two), target, ExportFilter())
+        assertEquals(2, result.exported)
+        val paths = entries(target).keys.filter { it.endsWith(".class") }
+        assertEquals(2, paths.map { it.lowercase() }.distinct().size)
+        assertTrue(paths.all { it.startsWith("classes-conflicts/") })
+    }
+
+    @Test fun `cancel later class preserves completed output and marks incomplete report`() {
+        val project = temporary.newFolder().toPath()
+        val one = jar(project.resolve("first.jar"), compile("First", "public class First {}"))
+        val two = jar(project.resolve("second.jar"), compile("Second", "public class Second {}"))
+        val target = project.resolve("sources")
+        assertThrows(CancellationException::class.java) {
+            ClassExportService.export(project, listOf(one, two), target, ExportFilter(),
+                ClassDecompiler { _, name, _ ->
+                    if (name == "Second") throw CancellationException()
+                    DecompiledClass("class First {}")
+                }, parallelism = 1)
+        }
+        assertEquals("class First {}", Files.readString(target.resolve("First.java")))
+        assertFalse(Files.exists(target.resolve("Second.java")))
+        assertTrue(Files.readString(target.resolve("export-report.txt")).contains("已落盘文件: 1"))
+    }
+
 }

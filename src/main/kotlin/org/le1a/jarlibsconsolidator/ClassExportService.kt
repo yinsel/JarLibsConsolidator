@@ -2,16 +2,12 @@ package org.le1a.jarlibsconsolidator
 
 import java.io.IOException
 import java.io.InputStream
-import java.nio.file.AtomicMoveNotSupportedException
 import java.nio.file.FileVisitResult
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.SimpleFileVisitor
-import java.nio.file.StandardCopyOption
 import java.nio.file.attribute.BasicFileAttributes
-import java.util.zip.ZipEntry
 import java.util.zip.ZipFile
-import java.util.zip.ZipOutputStream
 
 internal data class DecompilationIssue(val internalName: String?, val errorType: String, val reason: String)
 internal data class DecompiledClass(val source: String, val warnings: List<String> = emptyList(),
@@ -31,8 +27,8 @@ internal fun interface ClassDecompiler {
 /** IO-only export pipeline, separate from IntelliJ's UI and library discovery. */
 internal object ClassExportService {
     data class Result(val discovered: Int, val filtered: Int, val duplicates: Int, val exported: Int,
-                      val failures: List<String>, val decompilationFailed: Int = 0, val partiallyExported: Int = 0)
-    private data class DecompilationFailure(val item: Item, val entryName: String, val errorType: String, val reason: String)
+                      val failures: List<String>, val decompilationFailed: Int = 0, val partiallyExported: Int = 0,
+                      val failureCount: Int = failures.size)
     private data class Item(val name: String, val file: Path, val origin: String, val group: String, val digest: String)
     private data class UnitOfWork(val members: List<Item>, val digest: String) { val root get() = members.first() }
 
@@ -50,15 +46,16 @@ internal object ClassExportService {
         require(libraries.isNotEmpty()) { "没有已登记的依赖库，请先执行“一键添加依赖”后再导出。" }
         val base = project.toAbsolutePath().normalize()
         val destination = target.toAbsolutePath().normalize()
+        checkCanceled()
+        val output = ExportDirectory(destination)
         val work = Files.createTempDirectory("jarlibs-export-")
-        var archive: Path? = null
+        val reports = try { ExportReports(destination) } catch (e: Exception) { work.toFile().deleteRecursively(); throw e }
+        val written = java.util.concurrent.atomic.AtomicInteger()
         var discovered = 0
         var filtered = 0
         var duplicates = 0
         var exported = 0
         var partiallyExported = 0
-        val failures = mutableListOf<String>()
-        val decompilationFailures = mutableListOf<DecompilationFailure>()
         val items = mutableListOf<Item>()
         val seenFiles = mutableSetOf<Path>()
         val seenDirectories = mutableSetOf<Path>()
@@ -73,7 +70,7 @@ internal object ClassExportService {
             checkCanceled()
             PluginDiagnostics.rethrowCancellation(e)
             val reason = PluginDiagnostics.describe(e)
-            failures.add("$origin: $reason")
+            reports.warning("$origin: $reason")
             // Bound default stack logging on damaged archives; DEBUG retains every failure.
             if (loggedFailures++ < 20) PluginDiagnostics.warn("Export item failed: origin=$origin, target=$destination", e)
             else PluginDiagnostics.debug("Export item failed: origin=$origin, target=$destination", e)
@@ -115,7 +112,7 @@ internal object ClassExportService {
                             collect("$label!/${entry.name}", label, ClassSource(path, entry.name)) { zip.getInputStream(entry) }
                         } else if (!entry.isDirectory && entry.name.endsWith(".jar", true)) {
                             val origin = "$label!/${entry.name}"
-                            if (depth >= 8) { failures.add("$origin: 嵌套 JAR 超过 8 层"); continue }
+                            if (depth >= 8) { reports.warning("$origin: 嵌套 JAR 超过 8 层"); continue }
                             val nested = Files.createTempFile(work, "nested-", ".jar")
                             try {
                                 zip.getInputStream(entry).use { input -> Files.newOutputStream(nested).use { output ->
@@ -154,10 +151,11 @@ internal object ClassExportService {
         }
 
         fun scanDirectory(root: Path) {
-            if (!Files.exists(root)) { failures.add("${sourceLabel(root)}: 目录不存在"); return }
+            if (!Files.exists(root)) { reports.warning("${sourceLabel(root)}: 目录不存在"); return }
             Files.walkFileTree(root, object : SimpleFileVisitor<Path>() {
                 override fun preVisitDirectory(dir: Path, attrs: BasicFileAttributes): FileVisitResult {
                     checkCanceled()
+                    if (dir.startsWith(destination)) return FileVisitResult.SKIP_SUBTREE
                     scanProgress.update { "遍历依赖库：${sourceLabel(dir)}；已扫描 $discovered 个 class，已过滤 $filtered 个" }
                     if (dir != root && dir.fileName.toString() in setOf(".git", ".hg", ".svn")) return FileVisitResult.SKIP_SUBTREE
                     return if (seenDirectories.add(dir)) FileVisitResult.CONTINUE else FileVisitResult.SKIP_SUBTREE
@@ -185,105 +183,75 @@ internal object ClassExportService {
             checkCanceled()
             progress("依赖库扫描完成：$discovered 个 class，过滤 $filtered 个，待导出 ${items.size} 个", 0.3)
             PluginDiagnostics.info("Export scan complete: discovered=$discovered, filtered=$filtered, duplicates=$duplicates, selected=${items.size}")
-            archive = Files.createTempFile(destination.parent, ".jarlibs-export-", ".zip")
-            val report = mutableListOf("zip_entry\tsource")
-            val usedEntries = mutableSetOf<String>()
             val ordered = exportUnits(items, decompiler?.mergeInnerClasses == true, checkCanceled)
-            val outputVersions = ordered.groupingBy { it.root.name }.eachCount()
-            val processing: DecompilationPipeline? = decompiler?.let {
-                val groups = ordered.map { unit -> unit.members.map { member -> member.file to member.name } }
-                if (batchSize == 1) OrderedParallelDecompiler(ordered.map { unit -> unit.root.file to unit.root.name },
-                    it, parallelism, checkCanceled, groups)
-                else BatchParallelDecompiler(groups, it, parallelism, checkCanceled, batchSize)
+            // Portable collision grouping also isolates names differing only by case on Windows/macOS.
+            val outputVersions = ordered.groupingBy { it.root.name.lowercase(java.util.Locale.ROOT) }.eachCount()
+            val entries = ordered.map { unit ->
+                val item = unit.root
+                val extension = if (decompiler == null) "class" else "java"
+                val prefix = if (outputVersions.getValue(item.name.lowercase(java.util.Locale.ROOT)) == 1) "" else {
+                    val label = item.group.replace(Regex("[^\\p{L}\\p{N}._-]"), "_").take(50).ifEmpty { "project" }
+                    "classes-conflicts/$label--${unit.digest.take(16)}/"
+                }
+                "$prefix${item.name}.$extension"
+            }
+            check(entries.distinct().size == entries.size) { "重复的导出文件路径" }
+            val processing = decompiler?.let {
+                BatchParallelDecompiler(ordered.map { unit -> unit.members.map { member -> member.file to member.name } },
+                    it, parallelism, checkCanceled, batchSize) { index, source, check ->
+                    output.source(entries[index], source, check)
+                    written.incrementAndGet()
+                }
             }
             processing.use {
-                ZipOutputStream(Files.newOutputStream(archive)).use { zip ->
-                    for ((index, unit) in ordered.withIndex()) {
-                        val item = unit.root
-                        checkCanceled()
-                        progress(if (decompiler == null) "打包：${item.name}" else "反编译：${item.name}", 0.3 + 0.65 * index / ordered.size.coerceAtLeast(1))
-                        val extension = if (decompiler == null) "class" else "java"
-                        val prefix = if (outputVersions.getValue(item.name) == 1) "" else {
-                            val label = item.group.replace(Regex("[^\\p{L}\\p{N}._-]"), "_").take(50).ifEmpty { "project" }
-                            "classes-conflicts/$label--${unit.digest.take(16)}/"
-                        }
-                        val entryName = "$prefix${item.name}.$extension"
-                        val source = try {
-                            processing?.next()?.also { result ->
-                                if (result.source.isBlank()) throw IOException("反编译器未生成源码")
-                                result.warnings.forEach { failures.add("${item.origin}: $it") }
-                                if (result.issues.isNotEmpty()) {
-                                    partiallyExported++
-                                    for (member in unit.members) {
-                                        val issues = result.issues.filter { issue -> issue.internalName == member.name ||
-                                            unit.members.none { it.name == issue.internalName } }
-                                        if (issues.isEmpty()) continue
-                                        val reason = issues.joinToString("\n") { it.reason }
-                                        failures.add("${member.origin}: 部分源码，存在失败的方法：$reason")
-                                        decompilationFailures.add(DecompilationFailure(member, entryName,
-                                            issues.map { it.errorType }.distinct().joinToString("; "), reason))
-                                    }
-                                }
-                            }?.source
-                        } catch (e: Exception) {
-                            val reason = failure(item.origin, e) // Cancellation propagates before being counted.
-                            unit.members.forEach { member ->
-                                decompilationFailures.add(DecompilationFailure(member, entryName, e.javaClass.name, reason))
+                for ((index, unit) in ordered.withIndex()) {
+                    val item = unit.root
+                    val entryName = entries[index]
+                    checkCanceled()
+                    progress("${if (decompiler == null) "复制" else "反编译并写入"}：${item.name}（已落盘 ${written.get()} 个文件）", 0.3 + 0.65 * index / ordered.size.coerceAtLeast(1))
+                    val result = try { processing?.next() }
+                    catch (e: ExportWriteException) { throw e }
+                    catch (e: Exception) {
+                        val reason = failure(item.origin, e)
+                        unit.members.forEach { member -> reports.failedClass(member.name, member.origin,
+                            member.digest, entryName, e.javaClass.name, reason) }
+                        continue
+                    }
+                    if (result == null) {
+                        output.copy(entryName, { Files.newInputStream(item.file) }, checkCanceled)
+                        written.incrementAndGet()
+                    } else {
+                        result.warnings.forEach { reports.warning("${item.origin}: $it") }
+                        if (result.issues.isNotEmpty()) {
+                            partiallyExported++
+                            for (member in unit.members) {
+                                val issues = result.issues.filter { issue -> issue.internalName == member.name ||
+                                    unit.members.none { it.name == issue.internalName } }
+                                if (issues.isEmpty()) continue
+                                val reason = issues.joinToString("\n") { it.reason }
+                                reports.warning("${member.origin}: 部分源码，存在失败的方法：$reason")
+                                reports.failedClass(member.name, member.origin, member.digest, entryName,
+                                    issues.map { it.errorType }.distinct().joinToString("; "), reason)
                             }
-                            continue
                         }
-                        checkCanceled()
-                        PluginDiagnostics.debug { "Write ZIP entry: origin=${item.origin}, entry=$entryName, target=$destination" }
-                        check(usedEntries.add(entryName)) { "重复的 ZIP 条目：$entryName" }
-                        // ZIP write errors abort the archive, rather than leaving a corrupt partial entry.
-                        zip.putNextEntry(ZipEntry(entryName))
-                        if (source == null) Files.newInputStream(item.file).use { input ->
-                            val buffer = ByteArray(8192)
-                            while (true) {
-                                checkCanceled()
-                                val size = input.read(buffer)
-                                if (size < 0) break
-                                zip.write(buffer, 0, size)
-                            }
-                        } else zip.write(source.toByteArray(Charsets.UTF_8))
-                        zip.closeEntry()
-                        exported++
-                        unit.members.forEach { report.add("${tsv(entryName)}\t${tsv(it.origin)}") }
                     }
-                    val summary = "扫描 class: $discovered\n已过滤: $filtered\n相同内容去重: $duplicates\n已导出文件: $exported\n失败/警告: ${failures.size}\n" +
-                            (if (decompiler == null) "" else "反编译失败: ${decompilationFailures.size}\n已保留部分源码文件: $partiallyExported（包含失败的方法，不代表完整成功）\n反编译入口：IDEA 原生 Java Bytecode Decompiler；原生源码原样保留。若原生入口会读取未选中的内部类，则跳过该源码文件并记录 CSV。部分源码按输出文件记录，具体失败方法见 idea.log。\n") +
-                            failures.joinToString("\n")
-                    if (decompilationFailures.isNotEmpty()) {
-                        zip.putNextEntry(ZipEntry("decompilation-failures.csv"))
-                        // UTF-8 BOM helps Excel recognize Chinese text; write rows incrementally.
-                        zip.write(byteArrayOf(0xEF.toByte(), 0xBB.toByte(), 0xBF.toByte()))
-                        fun csvRow(values: List<String>) {
-                            checkCanceled()
-                            zip.write((values.joinToString(",", transform = ::csvCell) + "\r\n").toByteArray(Charsets.UTF_8))
-                        }
-                        csvRow(listOf("完整类名", "来源文件或JAR条目", "字节码SHA-256", "计划导出路径", "异常类型", "失败原因"))
-                        for ((item, entryName, errorType, reason) in decompilationFailures) {
-                            csvRow(listOf(item.name.replace('/', '.'), item.origin, item.digest, entryName,
-                                errorType, reason))
-                        }
-                        zip.closeEntry()
-                    }
-                    for ((name, text) in listOf("export-report.txt" to summary, "export-sources.tsv" to report.joinToString("\n"))) {
-                        zip.putNextEntry(ZipEntry(name)); zip.write(text.toByteArray(Charsets.UTF_8)); zip.closeEntry()
-                    }
+                    exported++
+                    unit.members.forEach { reports.source(entryName, it.origin) }
                 }
             }
             checkCanceled()
-            try { Files.move(archive, destination, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING) }
-            catch (_: AtomicMoveNotSupportedException) { Files.move(archive, destination, StandardCopyOption.REPLACE_EXISTING) }
-            archive = null
-            progress("导出完成", 1.0)
-            if (failures.isNotEmpty()) PluginDiagnostics.warn("Export completed with ${failures.size} failures/warnings: target=$destination; see export-report.txt; first 20 exception stacks at WARN, remaining at DEBUG")
-            return Result(discovered, filtered, duplicates, exported, failures, decompilationFailures.size, partiallyExported)
+            reports.finish("状态：导出完成\n扫描 class: $discovered\n已过滤: $filtered\n相同内容去重: $duplicates\n已导出文件: $exported\n失败/警告: ${reports.failureCount}\n" +
+                if (decompiler == null) "" else "反编译失败: ${reports.decompilationFailed}\n已保留部分源码文件: $partiallyExported（包含失败的方法，不代表完整成功）\n反编译入口：IDEA 原生 Java Bytecode Decompiler；源码逐文件落盘，未缓存已完成源码。\n")
+            progress("导出完成：$destination", 1.0)
+            if (reports.failureCount > 0) PluginDiagnostics.warn("Export completed with ${reports.failureCount} failures/warnings: target=$destination; see export-report.txt")
+            return Result(discovered, filtered, duplicates, exported, reports.preview.toList(), reports.decompilationFailed, partiallyExported, reports.failureCount)
+        } catch (e: Exception) {
+            try { reports.finish("状态：导出未完成（失败或取消）\n已落盘文件: ${written.get()}\n已完成文件保留；来源和失败报告可能尚未完整汇总。\n原因：${PluginDiagnostics.describe(e)}") } catch (reportError: Exception) { e.addSuppressed(reportError) }
+            throw e
         } finally {
-            decompiler?.releaseSources()
-            archive?.let { Files.deleteIfExists(it) }
-            work.toFile().deleteRecursively()
+            try { decompiler?.releaseSources() } finally {
+                try { reports.close() } finally { work.toFile().deleteRecursively() }
+            }
         }
     }
 
@@ -329,12 +297,4 @@ internal object ClassExportService {
         }
     }
 
-    private fun csvCell(value: String): String {
-        // CSV quoting handles separators/newlines; prefix formula-like data for spreadsheet viewers.
-        val first = value.trimStart().firstOrNull()
-        val safe = if (first in listOf('=', '+', '-', '@') || value.startsWith("\t") || value.startsWith("\r")) "'$value" else value
-        return "\"" + safe.replace("\"", "\"\"") + "\""
-    }
-
-    private fun tsv(text: String): String = text.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
 }

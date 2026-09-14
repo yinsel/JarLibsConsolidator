@@ -25,10 +25,11 @@ class DecompilerOptimizationTest {
             } finally { active.decrementAndGet() }
         }
         val inputs = (0..19).map { Path.of("unused") to "Class$it" }
-        OrderedParallelDecompiler(inputs, decompiler, 2, {}).use { pipeline ->
+        val sources = java.util.concurrent.ConcurrentHashMap<Int, String>()
+        BatchParallelDecompiler(inputs.map { listOf(it) }, decompiler, 2, {}, batchSize = 1, writeSource = { i, text, _ -> sources[i] = text }).use { pipeline ->
             assertTrue(started.await(5, TimeUnit.SECONDS))
             assertEquals(2, calls.get()) // No unbounded queue of completed sources.
-            inputs.forEach { assertEquals(it.second, pipeline.next().source) }
+            inputs.forEachIndexed { i, input -> pipeline.next(); assertEquals(input.second, sources[i]) }
         }
         assertEquals(2, peak.get())
         assertEquals(0, active.get())
@@ -47,8 +48,8 @@ class DecompilerOptimizationTest {
             }
             finally { active.decrementAndGet() }
         }
-        OrderedParallelDecompiler((0..9).map { Path.of("unused") to "Class$it" }, decompiler, 2,
-            { if (canceled.get()) throw CancellationException() }).use { pipeline ->
+        BatchParallelDecompiler((0..9).map { listOf(Path.of("unused") to "Class$it") }, decompiler, 2,
+            { if (canceled.get()) throw CancellationException() }, batchSize = 1, writeSource = { _, _, _ -> }).use { pipeline ->
             assertTrue(started.await(5, TimeUnit.SECONDS))
             canceled.set(true)
             assertThrows(CancellationException::class.java) { pipeline.next() }

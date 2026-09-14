@@ -10,14 +10,14 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 
-/** Bounded work window; only the calling thread writes ZIP entries, in stable order. */
-internal class OrderedParallelDecompiler(
+/** Historical scheduler for the scan benchmark only; never shipped in the plugin. */
+internal class PreStreamingParallelDecompiler(
     private val inputs: List<Pair<Path, String>>,
     private val decompiler: ClassDecompiler,
     parallelism: Int,
     private val checkCanceled: () -> Unit,
     private val groups: List<List<Pair<Path, String>>>? = null
-) : DecompilationPipeline {
+) : AutoCloseable {
     private val stopped = AtomicBoolean()
     private val workers = parallelism.coerceIn(1, 4)
     private val pool = if (workers > 1 && inputs.size > 1) Executors.newFixedThreadPool(workers) { task ->
@@ -45,7 +45,7 @@ internal class OrderedParallelDecompiler(
         })
     }
 
-    override fun next(): DecompiledClass {
+    fun next(): DecompiledClass {
         checkCanceled()
         if (pool == null) {
             val index = consumed++

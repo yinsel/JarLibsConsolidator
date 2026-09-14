@@ -25,12 +25,13 @@ class BatchParallelDecompilerTest {
             DecompiledClass("source-$index", if (index == 17) listOf("warning") else emptyList(),
                 if (index == 18) listOf(DecompilationIssue("18", "IOException", "method failed")) else emptyList())
         }
-        BatchParallelDecompiler(inputs(83), decompiler, 2, {}, memoryBudget = 1).use { pipeline ->
+        val sources = java.util.concurrent.ConcurrentHashMap<Int, String>()
+        BatchParallelDecompiler(inputs(83), decompiler, 2, {}, writeSource = { i, text, _ -> sources[i] = text }).use { pipeline ->
             for (i in 0 until 83) {
                 if (i == 13 || i == 41) assertEquals("broken-$i", assertThrows(IOException::class.java) { pipeline.next() }.message)
                 else {
                     val result = pipeline.next()
-                    assertEquals("source-$i", result.source)
+                    assertEquals("source-$i", sources[i])
                     assertEquals(if (i == 17) listOf("warning") else emptyList<String>(), result.warnings)
                     assertEquals(if (i == 18) listOf(DecompilationIssue("18", "IOException", "method failed")) else emptyList<DecompilationIssue>(), result.issues)
                 }
@@ -52,7 +53,7 @@ class BatchParallelDecompilerTest {
             finally { active.decrementAndGet() }
         }
         BatchParallelDecompiler(inputs(200), decompiler, 2,
-            { if (cancel.get()) throw CancellationException() }).use { pipeline ->
+            { if (cancel.get()) throw CancellationException() }, writeSource = { _, _, _ -> }).use { pipeline ->
             assertTrue(started.await(5, TimeUnit.SECONDS))
             cancel.set(true)
             assertThrows(CancellationException::class.java) { pipeline.next() }

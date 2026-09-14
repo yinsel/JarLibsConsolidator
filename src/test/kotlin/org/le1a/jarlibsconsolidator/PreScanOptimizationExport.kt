@@ -32,7 +32,7 @@ internal object PreScanOptimizationExport {
         decompiler: ClassDecompiler? = null,
         checkCanceled: () -> Unit = {},
         progress: (String, Double) -> Unit = { _, _ -> },
-        parallelism: Int = OrderedParallelDecompiler.defaultParallelism()
+        parallelism: Int = PreStreamingParallelDecompiler.defaultParallelism()
     ): Result {
         val base = project.toAbsolutePath().normalize()
         val destination = target.toAbsolutePath().normalize()
@@ -169,7 +169,7 @@ internal object PreScanOptimizationExport {
             val usedEntries = mutableSetOf<String>()
             val ordered = items.sortedWith(compareBy<Item> { it.name }.thenBy { it.origin })
             val processing = decompiler?.let {
-                OrderedParallelDecompiler(ordered.map { item -> item.file to item.name }, it, parallelism, checkCanceled)
+                PreStreamingParallelDecompiler(ordered.map { item -> item.file to item.name }, it, parallelism, checkCanceled)
             }
             processing.use {
                 ZipOutputStream(Files.newOutputStream(archive)).use { zip ->

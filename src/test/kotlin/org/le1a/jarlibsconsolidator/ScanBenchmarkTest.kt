@@ -38,6 +38,7 @@ class ScanBenchmarkTest {
         for ((dataset, root) in listOf("jar" to regular, "nested-fatjar" to fat)) {
             for ((selection, white) in listOf("all" to "", "one-percent" to "benchmark.allowed.*")) {
                 fun run(legacy: Boolean): Sample {
+                    output.toFile().deleteRecursively()
                     val start = System.nanoTime()
                     var scanFinished = 0L
                     var updates = 0
@@ -54,12 +55,12 @@ class ScanBenchmarkTest {
                     }
                     val total = (System.nanoTime() - start) / 1_000_000
                     val hash = MessageDigest.getInstance("SHA-256")
-                    ZipFile(output.toFile()).use { zip ->
-                        zip.entries().asSequence().sortedBy { it.name }.forEach { entry ->
-                            hash.update(entry.name.toByteArray(Charsets.UTF_8))
-                            hash.update(zip.getInputStream(entry).use { it.readBytes() })
-                        }
+                    val contents = if (legacy) ZipFile(output.toFile()).use { zip ->
+                        zip.entries().asSequence().filter { it.name.endsWith(".class") }.associate { it.name to zip.getInputStream(it).use { stream -> stream.readBytes() } }
+                    } else DirectoryOutput(output.toFile()).use { directory ->
+                        directory.entries().asSequence().filter { it.name.endsWith(".class") }.associate { it.name to directory.getInputStream(it).use { stream -> stream.readBytes() } }
                     }
+                    contents.toSortedMap().forEach { (name, bytes) -> hash.update(name.toByteArray(Charsets.UTF_8)); hash.update(bytes) }
                     return Sample((scanFinished - start) / 1_000_000, total, updates, count, HexFormat.of().formatHex(hash.digest()))
                 }
                 val expected = run(true)

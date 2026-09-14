@@ -11,7 +11,6 @@ import java.security.MessageDigest
 import java.util.HexFormat
 import java.util.concurrent.TimeUnit
 import java.util.zip.ZipEntry
-import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
 
 /** Opt-in, paired end-to-end benchmark; timings are observations, never flaky pass/fail thresholds. */
@@ -26,14 +25,15 @@ class ExportBenchmarkTest {
         assumeTrue(java.lang.Boolean.getBoolean("benchmark.exports"))
         val project = temporary.newFolder().toPath()
         val input = fixtureFatJar(800)
-        val target = project.resolve("batch.zip")
-        val previousWorkers = OrderedParallelDecompiler.defaultParallelism()
+        val target = project.resolve("batch")
+        val previousWorkers = (Runtime.getRuntime().availableProcessors() - 1).coerceIn(1, 4)
         val batchWorkers = BatchParallelDecompiler.defaultParallelism()
         val modes = listOf("serial", "previous", "batch-same-workers", "batch-native")
         val times = modes.associateWith { mutableListOf<Long>() }
         var expected: String? = null
         for (round in 0..3) for (offset in modes.indices) {
             val mode = modes[(round + offset) % modes.size]
+            target.toFile().deleteRecursively()
             val start = System.nanoTime()
             val result = ClassExportService.export(project, listOf(input), target, ExportFilter(),
                 IdeaJavaDecompiler(),
@@ -43,7 +43,7 @@ class ExportBenchmarkTest {
             assertEquals(result.failures.toString(), 0, result.decompilationFailed)
             assertEquals(800, result.exported)
             val digest = MessageDigest.getInstance("SHA-256")
-            ZipFile(target.toFile()).use { zip ->
+            DirectoryOutput(target.toFile()).use { zip ->
                 zip.entries().asSequence().filter { it.name != "export-report.txt" }.forEach { entry ->
                     digest.update(entry.name.toByteArray(Charsets.UTF_8))
                     digest.update(zip.getInputStream(entry).use { it.readBytes() })

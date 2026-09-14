@@ -14,7 +14,6 @@ import java.nio.file.Path
 import java.util.concurrent.CancellationException
 import java.util.concurrent.TimeUnit
 import java.util.zip.ZipEntry
-import java.util.zip.ZipFile
 import java.util.zip.ZipOutputStream
 
 class NativeIdeaDecompilerTest {
@@ -62,10 +61,10 @@ class NativeIdeaDecompilerTest {
             assertEquals("org.jetbrains.java.decompiler.IdeaDecompiler", native.javaClass.name)
             val expected = native.getText(vf).toString()
             assertTrue(expected, expected.contains("return 42;"))
-            val target = root.resolve("export.zip")
+            val target = ExportDirectory.suggest(root, "export")
             val result = ClassExportService.export(root, listOf(library), target, ExportFilter(), IdeaJavaDecompiler())
             assertEquals(result.failures.toString(), 1, result.exported)
-            ZipFile(target.toFile()).use { zip ->
+            DirectoryOutput(target.toFile()).use { zip ->
                 assertEquals(expected, zip.getInputStream(zip.getEntry("demo/Outer.java")).reader().readText())
             }
         }
@@ -81,25 +80,26 @@ class NativeIdeaDecompilerTest {
         }
         val direct = ClassFileDecompilers.getInstance().find(EditorIdeaText.resolve(ClassSource(inner, "demo/Outer.class")),
             ClassFileDecompilers.Light::class.java).getText(EditorIdeaText.resolve(ClassSource(inner, "demo/Outer.class"))).toString()
-        val target = root.resolve("export.zip")
+        val target = ExportDirectory.suggest(root, "export")
         val result = ClassExportService.export(root, listOf(fat), target, ExportFilter(), IdeaJavaDecompiler())
         assertEquals(result.failures.toString(), 1, result.exported)
-        ZipFile(target.toFile()).use { zip -> assertEquals(direct, zip.getInputStream(zip.getEntry("demo/Outer.java")).reader().readText()) }
+        DirectoryOutput(target.toFile()).use { zip -> assertEquals(direct, zip.getInputStream(zip.getEntry("demo/Outer.java")).reader().readText()) }
     }
 
     @Test fun `native partial source is unchanged and CSV records the output file without guessing failed member`() {
         val classes = fixture()
         val root = temporary.newFolder().toPath()
-        val target = root.resolve("export.zip")
+        val target = ExportDirectory.suggest(root, "export")
         val text = "class Outer {\r\n  void broken() {\r\n    // \$FF: Couldn't be decompiled\r\n  }\r\n}\r\n"
         var calls = 0
         val reader = NativeIdeaText { _, _, _ -> calls++; text }
         repeat(2) {
+            target.toFile().deleteRecursively()
             val result = ClassExportService.export(root, listOf(classes), target, ExportFilter(), IdeaJavaDecompiler(reader))
             assertEquals(1, result.exported)
             assertEquals(1, result.partiallyExported)
             assertEquals(1, result.decompilationFailed)
-            ZipFile(target.toFile()).use { zip ->
+            DirectoryOutput(target.toFile()).use { zip ->
                 assertEquals(text, zip.getInputStream(zip.getEntry("demo/Outer.java")).reader().readText())
                 val csv = zip.getInputStream(zip.getEntry("decompilation-failures.csv")).reader().readText()
                 assertTrue(csv, csv.contains("IDEA.NativePartialSource") && csv.contains("第 3 行"))
@@ -141,7 +141,7 @@ class NativeIdeaDecompilerTest {
             assertTrue(selected.values.all(Files::exists))
             "class Outer {}"
         }
-        val result = ClassExportService.export(root, listOf(first, second), root.resolve("export.zip"), ExportFilter(), IdeaJavaDecompiler(reader))
+        val result = ClassExportService.export(root, listOf(first, second), root.resolve("export"), ExportFilter(), IdeaJavaDecompiler(reader))
         assertEquals(1, result.exported)
         assertEquals(1, sources.size)
         assertTrue(sources.single().container == first || sources.single().container == second)

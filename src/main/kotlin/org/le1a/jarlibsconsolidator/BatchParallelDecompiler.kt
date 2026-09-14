@@ -1,66 +1,69 @@
 package org.le1a.jarlibsconsolidator
 
-import java.nio.file.Files
+import java.io.IOException
 import java.nio.file.Path
 import java.util.ArrayDeque
+import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.CancellationException
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicLong
 
-internal interface DecompilationPipeline : AutoCloseable {
-    fun next(): DecompiledClass
-}
+/** Completed work contains diagnostics only; source text never enters a queue or Future. */
+internal data class WrittenClass(val warnings: List<String>, val issues: List<DecompilationIssue>)
 
-/** Parallel batches, sequential families within each batch; one caller writes the ordered ZIP. */
+/** Write each class immediately; batch queues carry at most one small outcome each. */
 internal class BatchParallelDecompiler(
     private val groups: List<List<Pair<Path, String>>>,
     private val decompiler: ClassDecompiler,
     parallelism: Int,
     private val checkCanceled: () -> Unit,
     private val batchSize: Int = 40,
-    private val memoryBudget: Long = 32L * 1024 * 1024
-) : DecompilationPipeline {
-    private data class Outcome(var source: String? = null, val file: Path? = null,
-                               val warnings: List<String> = emptyList(), val error: Exception? = null,
-                               val issues: List<DecompilationIssue> = emptyList(),
-                               val weight: Long = 0)
+    private val writeSource: (Int, String, () -> Unit) -> Unit
+) : AutoCloseable {
+    private data class Outcome(val result: WrittenClass? = null, val error: Exception? = null)
+    private class Batch(val count: Int) {
+        val queue = ArrayBlockingQueue<Outcome>(1)
+        lateinit var future: Future<*>
+        var consumed = 0
+    }
     init { require(batchSize > 0) }
     private val stopped = AtomicBoolean()
-    private val retained = AtomicLong()
-    private val staging = Files.createTempDirectory("jarlibs-source-batches-")
+    private val fatal = AtomicReference<Throwable?>()
     private val workers = minOf(parallelism.coerceAtLeast(1),
-        ((groups.size.toLong() + batchSize.coerceAtLeast(1) - 1) / batchSize.coerceAtLeast(1)).toInt().coerceAtLeast(1))
+        ((groups.size.toLong() + batchSize - 1) / batchSize).toInt().coerceAtLeast(1))
     private val pool = Executors.newFixedThreadPool(workers) { task ->
         Thread(task, "JarLibs-decompiler-batch").apply { isDaemon = true }
     }
-    private val pending = ArrayDeque<Future<List<Outcome>>>()
+    private val pending = ArrayDeque<Batch>()
     private var submitted = 0
-    private var current: List<Outcome>? = null
-    private var offset = 0
 
-    init {
-        repeat(workers) { submit() }
-    }
+    init { repeat(workers) { submit() } }
 
     private fun checkWorkerCanceled() {
         if (stopped.get() || Thread.currentThread().isInterrupted) throw CancellationException()
+        fatal.get()?.let { throw it }
         checkCanceled()
     }
 
-    private fun retain(result: DecompiledClass): Outcome {
-        val weight = result.source.length * 2L + 128L
-        val total = retained.addAndGet(weight)
-        if (total <= memoryBudget) return Outcome(source = result.source, warnings = result.warnings, issues = result.issues, weight = weight)
-        retained.addAndGet(-weight)
-        // Bound completed source retention independently of CPU count and batch count.
-        val file = Files.createTempFile(staging, "source-", ".txt")
-        Files.writeString(file, result.source)
-        return Outcome(file = file, warnings = result.warnings, issues = result.issues)
+    // Keep this scope separate from queue backpressure, so a blocked worker retains no completed source.
+    private fun runOne(index: Int): Outcome {
+        checkWorkerCanceled()
+        val result = try {
+            decompiler.decompileGroup(groups[index], ::checkWorkerCanceled).also {
+                if (it.source.isBlank()) throw IOException("反编译器未生成源码")
+            }
+        } catch (e: Exception) {
+            PluginDiagnostics.rethrowCancellation(e)
+            checkWorkerCanceled()
+            return Outcome(error = e)
+        }
+        // Disk failures abort the export; don't keep decompiling when the output cannot be written.
+        writeSource(index, result.source, ::checkWorkerCanceled)
+        return Outcome(WrittenClass(result.warnings, result.issues))
     }
 
     private fun submit() {
@@ -68,76 +71,65 @@ internal class BatchParallelDecompiler(
         val start = submitted
         val end = minOf(groups.size.toLong(), start.toLong() + batchSize).toInt()
         submitted = end
-        pending.addLast(pool.submit<List<Outcome>> {
-            (start until end).map { index ->
-                checkWorkerCanceled()
-                try { retain(decompiler.decompileGroup(groups[index], ::checkWorkerCanceled)) }
-                catch (e: Exception) {
-                    PluginDiagnostics.rethrowCancellation(e)
-                    checkWorkerCanceled()
-                    Outcome(error = e)
-                }
-            }
-        })
+        val batch = Batch(end - start)
+        batch.future = pool.submit {
+            try { for (index in start until end) {
+                val outcome = runOne(index)
+                while (!batch.queue.offer(outcome, 50, TimeUnit.MILLISECONDS)) checkWorkerCanceled()
+            } } catch (e: Throwable) { fatal.compareAndSet(null, e); throw e }
+        }
+        pending.addLast(batch)
     }
 
-    override fun next(): DecompiledClass {
+    fun next(): WrittenClass {
         checkCanceled()
-        if (current == null) {
-            val future = pending.first
-            while (true) {
-                checkCanceled()
-                try { current = future.get(50, TimeUnit.MILLISECONDS); break }
-                catch (_: TimeoutException) { /* Keep IDEA cancellation responsive. */ }
-                catch (e: ExecutionException) { throw (e.cause ?: e) }
-                catch (e: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                    throw CancellationException("反编译导出被中断").apply { initCause(e) }
-                }
+        val batch = pending.first
+        while (true) {
+            fatal.get()?.let { throw it }
+            checkCanceled()
+            val outcome = try { batch.queue.poll(50, TimeUnit.MILLISECONDS) }
+            catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw CancellationException("反编译导出被中断").apply { initCause(e) }
             }
-            pending.removeFirst()
-            offset = 0
-        }
-        val batch = current!!
-        val item = batch[offset++]
-        try {
-            item.error?.let { throw it }
-            val source = item.source ?: Files.readString(item.file!!)
-            return DecompiledClass(source, item.warnings, item.issues)
-        } finally {
-            item.source = null
-            retained.addAndGet(-item.weight)
-            item.file?.let { Files.deleteIfExists(it) }
-            if (offset == batch.size) {
-                current = null
-                checkCanceled()
-                submit()
+            if (outcome != null) {
+                batch.consumed++
+                if (batch.consumed == batch.count) {
+                    pending.removeFirst()
+                    checkCanceled()
+                    submit()
+                }
+                outcome.error?.let { throw it }
+                return outcome.result!!
+            }
+            if (batch.future.isDone) {
+                try { batch.future.get() }
+                catch (e: ExecutionException) { throw (e.cause ?: e) }
+                if (batch.queue.isNotEmpty()) continue // An offer can race the timed poll and future completion.
+                throw IllegalStateException("反编译任务结束但没有输出结果")
             }
         }
     }
 
     override fun close() {
         stopped.set(true)
-        pending.forEach { it.cancel(true) }
+        pending.forEach { it.future.cancel(true) }
         pool.shutdownNow()
         var interrupted = false
         while (!pool.isTerminated) {
             try { pool.awaitTermination(50, TimeUnit.MILLISECONDS) }
             catch (_: InterruptedException) { interrupted = true }
         }
-        current = null
         pending.clear()
-        staging.toFile().deleteRecursively()
         if (interrupted) Thread.currentThread().interrupt()
     }
 
     companion object {
-        fun defaultParallelism(): Int {
-            val runtime = Runtime.getRuntime()
-            // A conservative concurrency guard for high-core IDEs with a small configured heap.
-            // This is a scheduling allowance, not a hard limit on an engine's allocations.
-            val heapAllowance = (runtime.maxMemory() / (128L * 1024 * 1024)).coerceAtLeast(1)
-            return minOf(runtime.availableProcessors().toLong() * 2, heapAllowance, Int.MAX_VALUE.toLong()).toInt()
+        fun defaultParallelism(): Int = parallelismFor(Runtime.getRuntime().maxMemory(), Runtime.getRuntime().availableProcessors())
+        internal fun parallelismFor(heap: Long, cpus: Int): Int {
+            // Leave heap for IDEA itself; native decompilation still has an unavoidable working set.
+            val allowance = ((heap - 512L * 1024 * 1024) / (512L * 1024 * 1024)).coerceAtLeast(1)
+            return minOf(2L, cpus.toLong().coerceAtLeast(1), allowance).toInt()
         }
     }
 }

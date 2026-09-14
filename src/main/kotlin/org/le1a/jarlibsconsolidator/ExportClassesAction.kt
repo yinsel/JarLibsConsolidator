@@ -5,8 +5,8 @@ import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.application.ApplicationManager
 import com.intellij.openapi.application.ReadAction
-import com.intellij.openapi.fileChooser.FileChooserFactory
-import com.intellij.openapi.fileChooser.FileSaverDescriptor
+import com.intellij.openapi.fileChooser.FileChooser
+import com.intellij.openapi.fileChooser.FileChooserDescriptorFactory
 import com.intellij.openapi.module.ModuleManager
 import com.intellij.openapi.progress.ProcessCanceledException
 import com.intellij.openapi.progress.ProgressIndicator
@@ -24,7 +24,6 @@ import com.intellij.openapi.vfs.LocalFileSystem
 import java.awt.BorderLayout
 import java.awt.Dimension
 import java.awt.GridLayout
-import java.nio.file.Files
 import java.nio.file.Path
 import javax.swing.JComponent
 import javax.swing.JLabel
@@ -42,13 +41,14 @@ internal abstract class BaseExportAction(private val javaSources: Boolean) : AnA
         val base = project.basePath?.let(Path::of) ?: return
         val options = ExportOptionsDialog(project, javaSources)
         if (!options.showAndGet()) return
-        val defaultName = "${project.name}-${if (javaSources) "java-sources" else "classes"}.zip"
-        val saver = FileChooserFactory.getInstance().createSaveFileDialog(
-            FileSaverDescriptor("保存导出 ZIP", "选择 ZIP 文件的保存位置", "zip"), project)
+        val defaultName = "${project.name}-${if (javaSources) "java-sources" else "classes"}"
+        val chooser = FileChooserDescriptorFactory.createSingleFolderDescriptor().apply {
+            title = "选择导出父目录"
+            description = "将在所选目录中创建 $defaultName；同名目录已存在时自动添加序号。"
+        }
         val initial = LocalFileSystem.getInstance().findFileByIoFile(base.toFile())
-        val selected = saver.save(initial, defaultName)?.file ?: return
-        val target = (if (selected.name.endsWith(".zip", true)) selected else java.io.File(selected.parentFile, selected.name + ".zip")).toPath()
-        if (Files.exists(target) && Messages.showYesNoDialog(project, "文件已存在，是否替换？\n$target", "确认覆盖", Messages.getQuestionIcon()) != Messages.YES) return
+        val selected = FileChooser.chooseFile(chooser, project, initial) ?: return
+        val target = ExportDirectory.suggest(Path.of(selected.path), defaultName)
         val whitelist = options.whitelist.text
         val blacklist = options.blacklist.text
         val filter = ExportFilter(whitelist, blacklist)
@@ -82,24 +82,27 @@ internal abstract class BaseExportAction(private val javaSources: Boolean) : AnA
                             indicator.text = text
                             if (fraction >= 0.3) indicator.fraction = fraction
                         })
-                    PluginDiagnostics.info("Export complete: target=$target, discovered=${result.discovered}, filtered=${result.filtered}, duplicates=${result.duplicates}, exported=${result.exported}, failures=${result.failures.size}, decompilationFailed=${result.decompilationFailed}, elapsedMs=${(System.nanoTime() - started) / 1_000_000}")
+                    PluginDiagnostics.info("Export complete: target=$target, discovered=${result.discovered}, filtered=${result.filtered}, duplicates=${result.duplicates}, exported=${result.exported}, failures=${result.failureCount}, decompilationFailed=${result.decompilationFailed}, elapsedMs=${(System.nanoTime() - started) / 1_000_000}")
                     ApplicationManager.getApplication().invokeLater {
                         if (!project.isDisposed) {
                             val message = "已导出 ${result.exported} 个文件\n扫描 ${result.discovered} 个 class，过滤 ${result.filtered} 个，相同内容去重 ${result.duplicates} 个\n" +
                                     (if (result.partiallyExported > 0) "其中 ${result.partiallyExported} 个为部分源码（存在失败的方法）\n" else "") +
                                     (if (javaSources) "反编译失败：${result.decompilationFailed} 个\n" +
-                                        (if (result.decompilationFailed > 0) "失败明细见 ZIP 内 decompilation-failures.csv\n" else "") else "") +
-                                    "全部失败/警告 ${result.failures.size} 项，详细列表见 ZIP 内 export-report.txt\n\n$target"
-                            if (result.failures.isEmpty()) Messages.showInfoMessage(project, message, "导出完成")
+                                        (if (result.decompilationFailed > 0) "失败明细见 文件夹内 decompilation-failures.csv\n" else "") else "") +
+                                    "全部失败/警告 ${result.failureCount} 项，详细列表见 文件夹内 export-report.txt\n\n$target"
+                            if (result.failureCount == 0) Messages.showInfoMessage(project, message, "导出完成")
                             else Messages.showWarningDialog(project, message, "导出完成（有失败或警告）")
                         }
                     }
-                } catch (e: ProcessCanceledException) { throw e }
+                } catch (e: ProcessCanceledException) {
+                    PluginDiagnostics.info("Export canceled; completed files retained: target=$target")
+                    throw e
+                }
                 catch (e: Exception) {
                     PluginDiagnostics.rethrowCancellation(e)
                     PluginDiagnostics.warn("Export failed: project=$base, target=$target, javaSources=$javaSources", e)
                     ApplicationManager.getApplication().invokeLater {
-                        if (!project.isDisposed) Messages.showErrorDialog(project, PluginDiagnostics.userMessage("导出失败：$target", e), "导出失败")
+                        if (!project.isDisposed) Messages.showErrorDialog(project, PluginDiagnostics.userMessage("导出未完成：$target\n已写入文件保留，可查看 export-report.txt。", e), "导出失败")
                     }
                 }
             }
@@ -116,7 +119,7 @@ private class ExportOptionsDialog(project: Project, javaSources: Boolean) : Dial
 
     init {
         title = if (javaSources) "一键反编译并导出 JAVA" else "一键导出 CLASS"
-        setOKButtonText("选择 ZIP 保存位置…")
+        setOKButtonText("选择导出父目录…")
         init()
     }
 
