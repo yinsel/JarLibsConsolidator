@@ -17,7 +17,7 @@ internal class OrderedParallelDecompiler(
     parallelism: Int,
     private val checkCanceled: () -> Unit,
     private val groups: List<List<Pair<Path, String>>>? = null
-) : AutoCloseable {
+) : DecompilationPipeline {
     private val stopped = AtomicBoolean()
     private val workers = parallelism.coerceIn(1, 4)
     private val pool = if (workers > 1 && inputs.size > 1) Executors.newFixedThreadPool(workers) { task ->
@@ -45,7 +45,7 @@ internal class OrderedParallelDecompiler(
         })
     }
 
-    fun next(): DecompiledClass {
+    override fun next(): DecompiledClass {
         checkCanceled()
         if (pool == null) {
             val index = consumed++
