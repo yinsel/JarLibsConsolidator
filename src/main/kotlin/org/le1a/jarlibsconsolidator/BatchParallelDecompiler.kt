@@ -15,7 +15,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 /** Completed work contains diagnostics only; source text never enters a queue or Future. */
 internal data class WrittenClass(val warnings: List<String>, val issues: List<DecompilationIssue>)
 
-/** Write each class immediately; batch queues carry at most one small outcome each. */
+/** Write each class immediately; batch queues carry bounded diagnostics only. */
 internal class BatchParallelDecompiler(
     private val groups: List<List<Pair<Path, String>>>,
     private val decompiler: ClassDecompiler,
@@ -26,7 +26,7 @@ internal class BatchParallelDecompiler(
 ) : AutoCloseable {
     private data class Outcome(val result: WrittenClass? = null, val error: Exception? = null)
     private class Batch(val count: Int) {
-        val queue = ArrayBlockingQueue<Outcome>(1)
+        val queue = ArrayBlockingQueue<Outcome>(minOf(count, 40))
         lateinit var future: Future<*>
         var consumed = 0
     }

@@ -38,6 +38,29 @@ class StreamingExportTest {
         assertEquals(40L, Files.list(output.root).use { it.count() })
     }
 
+    @Test fun `later batch keeps writing all forty files while an earlier class is slow`() {
+        val firstStarted = CountDownLatch(1)
+        val releaseFirst = CountDownLatch(1)
+        val laterWritten = CountDownLatch(40)
+        val output = ExportDirectory(temporary.newFolder().toPath().resolve("sources"))
+        val engine = ClassDecompiler { _, name, _ ->
+            if (name == "0") { firstStarted.countDown(); check(releaseFirst.await(5, TimeUnit.SECONDS)) }
+            DecompiledClass("class C$name {}")
+        }
+        BatchParallelDecompiler(groups(80), engine, 2, {}, writeSource = { i, source, check ->
+            output.source("C$i.java", source, check)
+            if (i >= 40) laterWritten.countDown()
+        }).use { pipeline ->
+            try {
+                assertTrue(firstStarted.await(5, TimeUnit.SECONDS))
+                assertTrue("Later batch must not stall behind the first class", laterWritten.await(5, TimeUnit.SECONDS))
+                assertEquals("class C79 {}", Files.readString(output.root.resolve("C79.java")))
+                assertFalse(Files.exists(output.root.resolve("C0.java")))
+            } finally { releaseFirst.countDown() }
+            repeat(80) { pipeline.next() }
+        }
+    }
+
     @Test fun `cancel while writing removes partial file and retains previous complete source`() {
         val output = ExportDirectory(temporary.newFolder().toPath().resolve("sources"))
         output.source("demo/Good.java", "complete") {}
