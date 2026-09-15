@@ -18,6 +18,7 @@ internal fun interface ClassDecompiler {
     val requiresOriginalFiles: Boolean get() = false
     fun registerSource(snapshot: Path, source: ClassSource) {}
     fun releaseSources() {}
+    fun parallelismHint(): (() -> Int?)? = null
     fun decompileGroup(inputs: List<Pair<Path, String>>, checkCanceled: () -> Unit): DecompiledClass {
         require(inputs.size == 1)
         return decompile(inputs[0].first, inputs[0].second, checkCanceled)
@@ -42,7 +43,7 @@ internal object ClassExportService {
         decompiler: ClassDecompiler? = null,
         checkCanceled: () -> Unit = {},
         progress: (String, Double) -> Unit = { _, _ -> },
-        parallelism: Int = BatchParallelDecompiler.defaultParallelism(),
+        parallelism: Int? = null,
         batchSize: Int = 40,
         format: ExportFormat = ExportFormat.DIRECTORY
     ): Result {
@@ -209,8 +210,12 @@ internal object ClassExportService {
             }
             check(entries.distinct().size == entries.size) { "重复的导出文件路径" }
             val processing = decompiler?.let {
+                // Plan after scanning: the index and VFS now count toward used IDE heap.
+                val automatic = if (parallelism == null) AutomaticExportParallelism(it) else null
+                val initial = parallelism ?: requireNotNull(automatic).current()
                 BatchParallelDecompiler(ordered.map { unit -> unit.members.map { member -> member.file to member.name } },
-                    it, parallelism, checkCanceled, batchSize) { index, source, check ->
+                    it, initial, checkCanceled, batchSize,
+                    parallelismLimit = { automatic?.current() ?: initial }) { index, source, check ->
                     output.source(entries[index], source, check)
                     written.incrementAndGet()
                 }

@@ -24,6 +24,7 @@ internal data class ClassSource(val container: Path, val entry: String? = null)
 
 internal fun interface NativeIdeaText {
     fun read(source: ClassSource, selected: Map<ClassSource, Path>, checkCanceled: () -> Unit): String
+    fun parallelismHint(source: ClassSource): (() -> Int?)? = null
 }
 
 /** Delegate to the registered editor decompiler, without options, retries, bytecode edits or a source cache. */
@@ -39,6 +40,8 @@ internal class IdeaJavaDecompiler(private val nativeText: NativeIdeaText = Edito
     }
 
     override fun releaseSources() { sources.clear(); selected.clear() }
+
+    override fun parallelismHint(): (() -> Int?)? = sources.values.firstOrNull()?.let(nativeText::parallelismHint)
 
     override fun decompile(file: Path, internalName: String, checkCanceled: () -> Unit): DecompiledClass =
         decompileGroup(listOf(file to internalName), checkCanceled)
@@ -79,6 +82,26 @@ internal class IdeaJavaDecompiler(private val nativeText: NativeIdeaText = Edito
 
 /** This is the same Light.getText entry called by IDEA for Java class editor text. */
 internal object EditorIdeaText : NativeIdeaText {
+    override fun parallelismHint(source: ClassSource): (() -> Int?)? {
+        val native = ClassFileDecompilers.getInstance().find(resolve(source), ClassFileDecompilers.Light::class.java)
+            ?: return null
+        return optionalParallelismHint(native)
+    }
+
+    /** No binary dependency on the customized plugin; stock IDEA keeps working. */
+    internal fun optionalParallelismHint(native: Any): (() -> Int?)? {
+        val method = try { native.javaClass.getMethod("getRecommendedParallelism") }
+            catch (_: NoSuchMethodException) { return null }
+        return {
+            try { (method.invoke(native) as? Int)?.takeIf { it > 0 } }
+            catch (e: ReflectiveOperationException) {
+                PluginDiagnostics.rethrowCancellation(e)
+                PluginDiagnostics.debug("Decompiler scheduling hint unavailable; using resource estimate", e)
+                null
+            }
+        }
+    }
+
     override fun read(source: ClassSource, selected: Map<ClassSource, Path>, checkCanceled: () -> Unit): String {
         val app = ApplicationManager.getApplication()
         check(!app.isDispatchThread && !app.isWriteAccessAllowed) { "反编译必须在后台线程执行" }

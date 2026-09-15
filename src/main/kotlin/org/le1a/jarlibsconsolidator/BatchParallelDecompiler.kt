@@ -21,6 +21,7 @@ internal class BatchParallelDecompiler(
     parallelism: Int,
     private val checkCanceled: () -> Unit,
     private val batchSize: Int = 40,
+    private val parallelismLimit: () -> Int = { parallelism },
     private val writeSource: (Int, String, () -> Unit) -> Unit
 ) : AutoCloseable {
     init { require(batchSize > 0) }
@@ -29,6 +30,8 @@ internal class BatchParallelDecompiler(
     private val batchCount = ((groups.size.toLong() + batchSize - 1) / batchSize).toInt()
     internal val workers = minOf(parallelism.coerceAtLeast(1), batchCount.coerceAtLeast(1))
     private val nextBatch = AtomicInteger()
+    private val admission = Any()
+    private var active = 0
     // Only bounded diagnostics cross threads. A slow family cannot block consuming other families.
     private val completed = ArrayBlockingQueue<CompletedClass>((workers.toLong() * 40).coerceAtMost(Int.MAX_VALUE.toLong()).toInt())
     private val remainingWorkers = AtomicInteger(workers)
@@ -47,7 +50,9 @@ internal class BatchParallelDecompiler(
                         val start = batch * batchSize
                         val end = minOf(groups.size.toLong(), start.toLong() + batchSize).toInt()
                         for (index in start until end) {
-                            val outcome = runOne(index)
+                            acquirePermit()
+                            val outcome = try { runOne(index) }
+                                finally { synchronized(admission) { active-- } }
                             while (!completed.offer(outcome, 50, TimeUnit.MILLISECONDS)) checkWorkerCanceled()
                         }
                     }
@@ -57,6 +62,20 @@ internal class BatchParallelDecompiler(
                     remainingWorkers.decrementAndGet()
                 }
             }
+        }
+    }
+
+    private fun acquirePermit() {
+        while (true) {
+            checkWorkerCanceled()
+            synchronized(admission) {
+                if (active < parallelismLimit().coerceIn(1, workers)) {
+                    active++
+                    return
+                }
+            }
+            // Wait before entering the native API or reading the next class family.
+            Thread.sleep(50)
         }
     }
 
@@ -117,12 +136,10 @@ internal class BatchParallelDecompiler(
         fun analyzerParallelism(cpus: Int = Runtime.getRuntime().availableProcessors()): Int =
             (cpus.toLong().coerceAtLeast(1) * 2).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
 
-        fun defaultParallelism(): Int = 8
-
-        internal fun parseParallelism(text: String): Int? = text.trim().toIntOrNull()?.takeIf { it > 0 }
+        fun defaultParallelism(): Int = ExportResources.limit(ExportResources.snapshot())
 
         internal fun parallelismFor(heap: Long, cpus: Int, used: Long = 0): Int {
-            // Retained for historical benchmark comparisons; exports use the manual value.
+            // Retained for historical benchmark comparisons; production uses ExportResources.
             // Estimate available headroom without a forced GC. Reserve space for IDEA as well as
             // existing live objects; this is a scheduling estimate, not an engine memory limit.
             val reserve = maxOf(512L * 1024 * 1024, heap / 4)

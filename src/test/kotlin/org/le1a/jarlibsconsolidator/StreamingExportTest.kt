@@ -125,13 +125,11 @@ class StreamingExportTest {
         }
     }
 
-    @Test fun `manual concurrency defaults to eight and controls active workers`() {
-        assertEquals(8, BatchParallelDecompiler.defaultParallelism())
-        assertEquals(3, BatchParallelDecompiler.parseParallelism(" 3 "))
-        for (invalid in listOf("", "0", "-1", "1.5", "abc", "999999999999")) {
-            assertNull(BatchParallelDecompiler.parseParallelism(invalid))
-        }
-        for (requested in listOf(3, BatchParallelDecompiler.defaultParallelism())) {
+    @Test fun `resource plan controls active workers and retains batch identity`() {
+        val mib = ExportResources.MIB
+        val resourcePlan = ExportResources.limit(ExportResources.Snapshot(16, 32768 * mib, 24000 * mib, 4096 * mib, 1024 * mib), 8)
+        assertEquals(8, resourcePlan)
+        for (requested in listOf(3, resourcePlan)) {
             val ready = CountDownLatch(requested)
             val release = CountDownLatch(1)
             val active = AtomicInteger()
