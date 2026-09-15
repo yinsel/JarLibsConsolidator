@@ -10,10 +10,10 @@ import java.nio.file.Path
 internal class ExportWriteException(message: String, cause: Throwable) : IOException(message, cause)
 
 /** Own a newly created directory; never merge into or replace an existing export. */
-internal class ExportDirectory(val root: Path) {
+internal class ExportDirectory(val root: Path) : ExportOutput {
     init { Files.createDirectory(root) }
 
-    fun source(relative: String, text: String, checkCanceled: () -> Unit) = write(relative) { temp ->
+    override fun source(relative: String, text: String, checkCanceled: () -> Unit) = write(relative) { temp ->
         Files.newBufferedWriter(temp, Charsets.UTF_8).use { writer ->
             var offset = 0
             while (offset < text.length) {
@@ -25,7 +25,7 @@ internal class ExportDirectory(val root: Path) {
         }
     }
 
-    fun copy(relative: String, open: () -> InputStream, checkCanceled: () -> Unit) = write(relative) { temp ->
+    override fun copy(relative: String, open: () -> InputStream, checkCanceled: () -> Unit) = write(relative) { temp ->
         open().use { input -> Files.newOutputStream(temp).use { output ->
             val buffer = ByteArray(8192)
             while (true) {

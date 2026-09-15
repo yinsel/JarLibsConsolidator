@@ -43,13 +43,15 @@ internal abstract class BaseExportAction(private val javaSources: Boolean) : AnA
         val options = ExportOptionsDialog(project, javaSources)
         if (!options.showAndGet()) return
         val defaultName = "${project.name}-${if (javaSources) "java-sources" else "classes"}"
+        val format = options.format.selectedItem as ExportFormat
+        val location = if (format == ExportFormat.ZIP) "ZIP 内" else "文件夹内"
         val chooser = FileChooserDescriptorFactory.createSingleFolderDescriptor().apply {
             title = "选择导出父目录"
-            description = "将在所选目录中创建 $defaultName；同名目录已存在时自动添加序号。"
+            description = "将在所选目录中创建 $defaultName${if (format == ExportFormat.ZIP) ".zip" else ""}；同名输出已存在时自动添加序号。"
         }
         val initial = LocalFileSystem.getInstance().findFileByIoFile(base.toFile())
         val selected = FileChooser.chooseFile(chooser, project, initial) ?: return
-        val target = ExportDirectory.suggest(Path.of(selected.path), defaultName)
+        val target = format.suggest(Path.of(selected.path), defaultName)
         val whitelist = options.whitelist.text
         val blacklist = options.blacklist.text
         val filter = ExportFilter(whitelist, blacklist)
@@ -78,6 +80,7 @@ internal abstract class BaseExportAction(private val javaSources: Boolean) : AnA
                     }
                     PluginDiagnostics.debug { "Export registered libraries: ${libraries.joinToString()}" }
                     val result = ClassExportService.export(base, libraries, target, filter, decompiler(),
+                        format = format,
                         parallelism = when (concurrencyMode) {
                             1 -> BatchParallelDecompiler.analyzerParallelism()
                             2 -> 1
@@ -95,8 +98,8 @@ internal abstract class BaseExportAction(private val javaSources: Boolean) : AnA
                             val message = "已导出 ${result.exported} 个文件\n扫描 ${result.discovered} 个 class，过滤 ${result.filtered} 个，相同内容去重 ${result.duplicates} 个\n" +
                                     (if (result.partiallyExported > 0) "其中 ${result.partiallyExported} 个为部分源码（存在失败的方法）\n" else "") +
                                     (if (javaSources) "反编译失败：${result.decompilationFailed} 个\n" +
-                                        (if (result.decompilationFailed > 0) "失败明细见 文件夹内 decompilation-failures.csv\n" else "") else "") +
-                                    "全部失败/警告 ${result.failureCount} 项，详细列表见 文件夹内 export-report.txt\n\n$target"
+                                        (if (result.decompilationFailed > 0) "失败明细见 $location decompilation-failures.csv\n" else "") else "") +
+                                    "全部失败/警告 ${result.failureCount} 项，详细列表见 $location export-report.txt\n\n$target"
                             if (result.failureCount == 0) Messages.showInfoMessage(project, message, "导出完成")
                             else Messages.showWarningDialog(project, message, "导出完成（有失败或警告）")
                         }
@@ -109,7 +112,7 @@ internal abstract class BaseExportAction(private val javaSources: Boolean) : AnA
                     PluginDiagnostics.rethrowCancellation(e)
                     PluginDiagnostics.warn("Export failed: project=$base, target=$target, javaSources=$javaSources", e)
                     ApplicationManager.getApplication().invokeLater {
-                        if (!project.isDisposed) Messages.showErrorDialog(project, PluginDiagnostics.userMessage("导出未完成：$target\n已写入文件保留，可查看 export-report.txt。", e), "导出失败")
+                        if (!project.isDisposed) Messages.showErrorDialog(project, PluginDiagnostics.userMessage("导出未完成：$target\n已完成的输出会尽量保留；ZIP 写入损坏时会删除无效压缩包。", e), "导出失败")
                     }
                 }
             }
@@ -121,6 +124,7 @@ internal abstract class BaseExportAction(private val javaSources: Boolean) : AnA
 }
 
 private class ExportOptionsDialog(project: Project, private val javaSources: Boolean) : DialogWrapper(project) {
+    val format = JComboBox(ExportFormat.values())
     val whitelist = JTextArea(6, 35)
     val blacklist = JTextArea(6, 35)
     val concurrency = JComboBox(arrayOf("自动（根据 CPU 和可用堆内存）",
@@ -141,12 +145,18 @@ private class ExportOptionsDialog(project: Project, private val javaSources: Boo
         fields.add(JPanel(BorderLayout()).apply { add(JLabel("白名单（留空表示全部）"), BorderLayout.NORTH); add(JScrollPane(whitelist)) })
         fields.add(JPanel(BorderLayout()).apply { add(JLabel("黑名单（命中即排除）"), BorderLayout.NORTH); add(JScrollPane(blacklist)) })
         panel.add(fields, BorderLayout.CENTER)
-        if (javaSources) panel.add(JPanel(BorderLayout(8, 4)).apply {
+        val outputOptions = JPanel(GridLayout(0, 1, 0, 8))
+        outputOptions.add(JPanel(BorderLayout(8, 4)).apply {
+            add(JLabel("输出格式"), BorderLayout.WEST)
+            add(format, BorderLayout.CENTER)
+        })
+        if (javaSources) outputOptions.add(JPanel(BorderLayout(8, 4)).apply {
             add(JLabel("反编译并发"), BorderLayout.WEST)
             add(concurrency, BorderLayout.CENTER)
             add(JLabel("每批 40 个类族，完成即写入；提高并发会增加反编译期间的内存使用。"), BorderLayout.SOUTH)
-        }, BorderLayout.SOUTH)
-        panel.preferredSize = Dimension(780, if (javaSources) 340 else 280)
+        })
+        panel.add(outputOptions, BorderLayout.SOUTH)
+        panel.preferredSize = Dimension(780, if (javaSources) 390 else 330)
         return panel
     }
 }

@@ -41,15 +41,25 @@ internal object ClassExportService {
         checkCanceled: () -> Unit = {},
         progress: (String, Double) -> Unit = { _, _ -> },
         parallelism: Int = BatchParallelDecompiler.defaultParallelism(),
-        batchSize: Int = 40
+        batchSize: Int = 40,
+        format: ExportFormat = ExportFormat.DIRECTORY
     ): Result {
         require(libraries.isNotEmpty()) { "没有已登记的依赖库，请先执行“一键添加依赖”后再导出。" }
         val base = project.toAbsolutePath().normalize()
         val destination = target.toAbsolutePath().normalize()
         checkCanceled()
-        val output = ExportDirectory(destination)
         val work = Files.createTempDirectory("jarlibs-export-")
-        val reports = try { ExportReports(destination) } catch (e: Exception) { work.toFile().deleteRecursively(); throw e }
+        val output: ExportOutput = try {
+            if (format == ExportFormat.ZIP) ExportZip(destination, work) else ExportDirectory(destination)
+        } catch (e: Exception) { work.toFile().deleteRecursively(); throw e }
+        val reportRoot = if (format == ExportFormat.ZIP) work.resolve("reports") else destination
+        val reports = try {
+            if (format == ExportFormat.ZIP) Files.createDirectory(reportRoot)
+            ExportReports(reportRoot)
+        } catch (e: Exception) {
+            try { output.close() } finally { work.toFile().deleteRecursively() }
+            throw e
+        }
         val written = java.util.concurrent.atomic.AtomicInteger()
         var discovered = 0
         var filtered = 0
@@ -256,7 +266,9 @@ internal object ClassExportService {
             throw e
         } finally {
             try { decompiler?.releaseSources() } finally {
-                try { reports.close() } finally { work.toFile().deleteRecursively() }
+                try {
+                    try { reports.close(); output.appendReports(reportRoot) } finally { output.close() }
+                } finally { work.toFile().deleteRecursively() }
             }
         }
     }

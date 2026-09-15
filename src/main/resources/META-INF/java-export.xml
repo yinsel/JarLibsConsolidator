@@ -2,8 +2,8 @@
     <actions>
         <action id="org.le1a.jarlibsconsolidator.ExportJavaAction"
                 class="org.le1a.jarlibsconsolidator.ExportJavaAction"
-                text="一键反编译并导出 JAVA（文件夹）"
-                description="使用 IDEA 内置反编译器，按白名单和黑名单将 JAVA 源码逐文件导出到文件夹">
+                text="一键反编译并导出 JAVA（文件夹 / ZIP）"
+                description="使用 IDEA 内置反编译器，按白名单和黑名单将 JAVA 源码逐文件导出到文件夹或 ZIP">
             <add-to-group group-id="ProjectViewPopupMenu" anchor="last"/>
         </action>
     </actions>
