@@ -125,6 +125,37 @@ class StreamingExportTest {
         }
     }
 
+    @Test fun `manual concurrency defaults to eight and controls active workers`() {
+        assertEquals(8, BatchParallelDecompiler.defaultParallelism())
+        assertEquals(3, BatchParallelDecompiler.parseParallelism(" 3 "))
+        for (invalid in listOf("", "0", "-1", "1.5", "abc", "999999999999")) {
+            assertNull(BatchParallelDecompiler.parseParallelism(invalid))
+        }
+        for (requested in listOf(3, BatchParallelDecompiler.defaultParallelism())) {
+            val ready = CountDownLatch(requested)
+            val release = CountDownLatch(1)
+            val active = AtomicInteger()
+            val peak = AtomicInteger()
+            val engine = ClassDecompiler { _, _, _ ->
+                val count = active.incrementAndGet()
+                peak.updateAndGet { maxOf(it, count) }
+                ready.countDown()
+                try { check(release.await(10, TimeUnit.SECONDS)); DecompiledClass("class Sample {}") }
+                finally { active.decrementAndGet() }
+            }
+            BatchParallelDecompiler(groups(320), engine, requested, {}, writeSource = { _, _, _ -> }).use { pipeline ->
+                try {
+                    assertTrue(ready.await(5, TimeUnit.SECONDS))
+                    assertEquals(requested, pipeline.workers)
+                    assertEquals(requested, peak.get())
+                } finally { release.countDown() }
+                val indices = (0 until 320).map { pipeline.next().index }
+                assertEquals((0 until 320).toSet(), indices.toSet())
+            }
+            assertEquals(0, active.get())
+        }
+    }
+
     @Test fun `automatic concurrency uses CPU times two ceiling and available heap budget`() {
         val mib = 1024L * 1024
         assertEquals(2, BatchParallelDecompiler.parallelismFor(1024 * mib, 16))

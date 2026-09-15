@@ -19,11 +19,13 @@ import com.intellij.openapi.roots.OrderRootType
 import com.intellij.openapi.roots.libraries.LibraryTablesRegistrar
 import com.intellij.openapi.ui.DialogWrapper
 import com.intellij.openapi.ui.Messages
+import com.intellij.openapi.ui.ValidationInfo
 import com.intellij.openapi.vfs.JarFileSystem
 import com.intellij.openapi.vfs.LocalFileSystem
 import java.awt.BorderLayout
 import java.awt.Dimension
 import java.awt.GridLayout
+import java.awt.FlowLayout
 import java.nio.file.Path
 import javax.swing.JComboBox
 import javax.swing.JComponent
@@ -31,6 +33,9 @@ import javax.swing.JLabel
 import javax.swing.JPanel
 import javax.swing.JScrollPane
 import javax.swing.JTextArea
+import javax.swing.JTextField
+import javax.swing.BoxLayout
+import javax.swing.Box
 
 internal class ExportClassesAction : BaseExportAction(false)
 
@@ -55,7 +60,7 @@ internal abstract class BaseExportAction(private val javaSources: Boolean) : AnA
         val whitelist = options.whitelist.text
         val blacklist = options.blacklist.text
         val filter = ExportFilter(whitelist, blacklist)
-        val concurrencyMode = options.concurrency.selectedIndex
+        val parallelism = if (javaSources) requireNotNull(BatchParallelDecompiler.parseParallelism(options.concurrency.text)) else 1
         ProgressManager.getInstance().run(object : Task.Backgroundable(project, if (javaSources) "反编译并导出 JAVA" else "导出 CLASS", true) {
             override fun run(indicator: ProgressIndicator) {
                 val started = System.nanoTime()
@@ -81,11 +86,7 @@ internal abstract class BaseExportAction(private val javaSources: Boolean) : AnA
                     PluginDiagnostics.debug { "Export registered libraries: ${libraries.joinToString()}" }
                     val result = ClassExportService.export(base, libraries, target, filter, decompiler(),
                         format = format,
-                        parallelism = when (concurrencyMode) {
-                            1 -> BatchParallelDecompiler.analyzerParallelism()
-                            2 -> 1
-                            else -> BatchParallelDecompiler.defaultParallelism()
-                        },
+                        parallelism = parallelism,
                         checkCanceled = { indicator.checkCanceled() },
                         progress = { text, fraction ->
                             indicator.isIndeterminate = fraction < 0.3
@@ -127,13 +128,19 @@ private class ExportOptionsDialog(project: Project, private val javaSources: Boo
     val format = JComboBox(ExportFormat.values())
     val whitelist = JTextArea(6, 35)
     val blacklist = JTextArea(6, 35)
-    val concurrency = JComboBox(arrayOf("自动（根据 CPU 和可用堆内存）",
-        "高并发（${BatchParallelDecompiler.analyzerParallelism()} 个任务，CPU × 2）", "低内存（1 个任务）"))
+    val concurrency = JTextField(BatchParallelDecompiler.defaultParallelism().toString(), 6).apply { name = "exportParallelism" }
 
     init {
         title = if (javaSources) "一键反编译并导出 JAVA" else "一键导出 CLASS"
         setOKButtonText("选择导出父目录…")
         init()
+    }
+
+    override fun doValidate(): ValidationInfo? {
+        if (javaSources && BatchParallelDecompiler.parseParallelism(concurrency.text) == null) {
+            return ValidationInfo("并发数请输入大于 0 的整数。", concurrency)
+        }
+        return null
     }
 
     override fun createCenterPanel(): JComponent {
@@ -145,16 +152,21 @@ private class ExportOptionsDialog(project: Project, private val javaSources: Boo
         fields.add(JPanel(BorderLayout()).apply { add(JLabel("白名单（留空表示全部）"), BorderLayout.NORTH); add(JScrollPane(whitelist)) })
         fields.add(JPanel(BorderLayout()).apply { add(JLabel("黑名单（命中即排除）"), BorderLayout.NORTH); add(JScrollPane(blacklist)) })
         panel.add(fields, BorderLayout.CENTER)
-        val outputOptions = JPanel(GridLayout(0, 1, 0, 8))
-        outputOptions.add(JPanel(BorderLayout(8, 4)).apply {
-            add(JLabel("输出格式"), BorderLayout.WEST)
-            add(format, BorderLayout.CENTER)
-        })
-        if (javaSources) outputOptions.add(JPanel(BorderLayout(8, 4)).apply {
-            add(JLabel("反编译并发"), BorderLayout.WEST)
-            add(concurrency, BorderLayout.CENTER)
-            add(JLabel("每批 40 个类族，完成即写入；提高并发会增加反编译期间的内存使用。"), BorderLayout.SOUTH)
-        })
+        val outputOptions = JPanel().apply { layout = BoxLayout(this, BoxLayout.Y_AXIS) }
+        fun row(label: String, field: JComponent) = JPanel(FlowLayout(FlowLayout.LEFT, 0, 0)).apply {
+            add(JLabel(label)); add(Box.createHorizontalStrut(8)); add(field)
+            maximumSize = Dimension(Int.MAX_VALUE, preferredSize.height)
+            alignmentX = 0f
+        }
+        // Keep controls at their natural single-line size; GridLayout stretched
+        // the output-format combo to match the taller concurrency/help row.
+        outputOptions.add(row("输出格式", format))
+        if (javaSources) {
+            outputOptions.add(Box.createVerticalStrut(8))
+            outputOptions.add(row("反编译并发数", concurrency))
+            outputOptions.add(Box.createVerticalStrut(4))
+            outputOptions.add(JLabel("默认 8；每批 40 个类族，完成即写入。实际并发还受批次数和反编译器自身限制。").apply { alignmentX = 0f })
+        }
         panel.add(outputOptions, BorderLayout.SOUTH)
         panel.preferredSize = Dimension(780, if (javaSources) 390 else 330)
         return panel

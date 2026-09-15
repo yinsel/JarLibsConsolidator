@@ -117,12 +117,12 @@ internal class BatchParallelDecompiler(
         fun analyzerParallelism(cpus: Int = Runtime.getRuntime().availableProcessors()): Int =
             (cpus.toLong().coerceAtLeast(1) * 2).coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
 
-        fun defaultParallelism(): Int {
-            val runtime = Runtime.getRuntime()
-            return parallelismFor(runtime.maxMemory(), runtime.availableProcessors(), runtime.totalMemory() - runtime.freeMemory())
-        }
+        fun defaultParallelism(): Int = 8
+
+        internal fun parseParallelism(text: String): Int? = text.trim().toIntOrNull()?.takeIf { it > 0 }
 
         internal fun parallelismFor(heap: Long, cpus: Int, used: Long = 0): Int {
+            // Retained for historical benchmark comparisons; exports use the manual value.
             // Estimate available headroom without a forced GC. Reserve space for IDEA as well as
             // existing live objects; this is a scheduling estimate, not an engine memory limit.
             val reserve = maxOf(512L * 1024 * 1024, heap / 4)
