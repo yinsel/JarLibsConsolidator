@@ -28,7 +28,9 @@ internal fun interface ClassDecompiler {
 internal object ClassExportService {
     data class Result(val discovered: Int, val filtered: Int, val duplicates: Int, val exported: Int,
                       val failures: List<String>, val decompilationFailed: Int = 0, val partiallyExported: Int = 0,
-                      val failureCount: Int = failures.size)
+                      val failureCount: Int = failures.size) {
+        val successfullyExported: Int get() = exported - partiallyExported
+    }
     private data class Item(val name: String, val file: Path, val origin: String, val group: String, val digest: String)
     private data class UnitOfWork(val members: List<Item>, val digest: String) { val root get() = members.first() }
 
@@ -256,7 +258,7 @@ internal object ClassExportService {
                 }
             }
             checkCanceled()
-            reports.finish("状态：导出完成\n扫描 class: $discovered\n已过滤: $filtered\n相同内容去重: $duplicates\n已导出文件: $exported\n失败/警告: ${reports.failureCount}\n" +
+            reports.finish("状态：导出完成\n扫描 class: $discovered\n已过滤: $filtered\n相同内容去重: $duplicates\n已导出文件: $exported\n成功导出完整文件: ${exported - partiallyExported}\n失败/警告: ${reports.failureCount}\n" +
                 if (decompiler == null) "" else "反编译失败: ${reports.decompilationFailed}\n已保留部分源码文件: $partiallyExported（包含失败的方法，不代表完整成功）\n反编译入口：IDEA 原生 Java Bytecode Decompiler；源码逐文件落盘，未缓存已完成源码。\n")
             progress("导出完成：$destination", 1.0)
             if (reports.failureCount > 0) PluginDiagnostics.warn("Export completed with ${reports.failureCount} failures/warnings: target=$destination; see export-report.txt")

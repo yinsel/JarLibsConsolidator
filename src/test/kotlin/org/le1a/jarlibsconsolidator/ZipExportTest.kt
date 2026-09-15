@@ -61,6 +61,27 @@ class ZipExportTest {
         }
     }
 
+    @Test fun `success count excludes partial source and failed decompilation`() {
+        val classes = fixture()
+        val root = temporary.newFolder().toPath()
+        for (format in ExportFormat.values()) {
+            val target = format.suggest(root, "counts")
+            val engine = ClassDecompiler { _, name, _ ->
+                when (name) {
+                    "demo/B" -> DecompiledClass("class B { /* partial */ }", issues = listOf(
+                        DecompilationIssue("demo/B", "IDEA.NativePartialSource", "sample partial source")))
+                    "demo/C" -> throw IOException("sample failure")
+                    else -> DecompiledClass("class A {}")
+                }
+            }
+            val result = ClassExportService.export(root, listOf(classes), target, ExportFilter(), engine, format = format)
+            assertEquals(2, result.exported)
+            assertEquals(1, result.successfullyExported)
+            assertEquals(1, result.partiallyExported)
+            assertEquals(2, result.decompilationFailed)
+        }
+    }
+
     @Test fun `cancellation finalizes completed entries and includes incomplete report`() {
         val classes = fixture()
         val root = temporary.newFolder().toPath()

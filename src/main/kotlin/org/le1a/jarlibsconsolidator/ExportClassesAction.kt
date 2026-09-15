@@ -95,7 +95,7 @@ internal abstract class BaseExportAction(private val javaSources: Boolean) : AnA
                     PluginDiagnostics.info("Export complete: target=$target, discovered=${result.discovered}, filtered=${result.filtered}, duplicates=${result.duplicates}, exported=${result.exported}, failures=${result.failureCount}, decompilationFailed=${result.decompilationFailed}, elapsedMs=${(System.nanoTime() - started) / 1_000_000}")
                     ApplicationManager.getApplication().invokeLater {
                         if (!project.isDisposed) {
-                            val message = "已导出 ${result.exported} 个文件\n扫描 ${result.discovered} 个 class，过滤 ${result.filtered} 个，相同内容去重 ${result.duplicates} 个\n" +
+                            val message = "成功导出：${result.successfullyExported} 个完整文件\n已输出文件总数：${result.exported} 个\n扫描 ${result.discovered} 个 class，过滤 ${result.filtered} 个，相同内容去重 ${result.duplicates} 个\n" +
                                     (if (result.partiallyExported > 0) "其中 ${result.partiallyExported} 个为部分源码（存在失败的方法）\n" else "") +
                                     (if (javaSources) "反编译失败：${result.decompilationFailed} 个\n" +
                                         (if (result.decompilationFailed > 0) "失败明细见 $location decompilation-failures.csv\n" else "") else "") +
