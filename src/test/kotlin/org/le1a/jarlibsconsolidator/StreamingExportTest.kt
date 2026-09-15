@@ -154,7 +154,7 @@ class StreamingExportTest {
         }
     }
 
-    @Test fun `automatic concurrency uses CPU times two ceiling and available heap budget`() {
+    @Test fun `historical benchmark policy uses CPU times two ceiling and available heap budget`() {
         val mib = 1024L * 1024
         assertEquals(2, BatchParallelDecompiler.parallelismFor(1024 * mib, 16))
         assertEquals(6, BatchParallelDecompiler.parallelismFor(2048 * mib, 16))

@@ -83,9 +83,17 @@ internal class IdeaJavaDecompiler(private val nativeText: NativeIdeaText = Edito
 /** This is the same Light.getText entry called by IDEA for Java class editor text. */
 internal object EditorIdeaText : NativeIdeaText {
     override fun parallelismHint(source: ClassSource): (() -> Int?)? {
-        val native = ClassFileDecompilers.getInstance().find(resolve(source), ClassFileDecompilers.Light::class.java)
-            ?: return null
-        return optionalParallelismHint(native)
+        return try {
+            val native = ClassFileDecompilers.getInstance().find(resolve(source), ClassFileDecompilers.Light::class.java)
+                ?: return null
+            optionalParallelismHint(native)
+        } catch (e: Exception) {
+            PluginDiagnostics.rethrowCancellation(e)
+            // A changed/missing first source should fail its own export item, not the
+            // entire export merely because it was used for an optional scheduling hint.
+            PluginDiagnostics.debug("Cannot resolve decompiler scheduling hint; using resource estimate", e)
+            null
+        }
     }
 
     /** No binary dependency on the customized plugin; stock IDEA keeps working. */
