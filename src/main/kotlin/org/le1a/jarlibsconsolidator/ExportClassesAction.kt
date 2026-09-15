@@ -124,7 +124,7 @@ private class ExportOptionsDialog(project: Project, private val javaSources: Boo
     val whitelist = JTextArea(6, 35)
     val blacklist = JTextArea(6, 35)
     val concurrency = JComboBox(arrayOf("自动（根据 CPU 和可用堆内存）",
-        "Jar Analyzer 并发（${BatchParallelDecompiler.analyzerParallelism()} 个任务，CPU × 2）", "低内存（1 个任务）"))
+        "高并发（${BatchParallelDecompiler.analyzerParallelism()} 个任务，CPU × 2）", "低内存（1 个任务）"))
 
     init {
         title = if (javaSources) "一键反编译并导出 JAVA" else "一键导出 CLASS"
